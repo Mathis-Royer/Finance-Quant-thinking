@@ -10,14 +10,15 @@ The goal is to consolidate knowledge gained from academic papers, market observa
 
 ```
 Hedge_quant/
-├── README.md                    # This file
-├── Financial_thinking.md        # Theoretical reflections and research notes
-├── Quant_strategies.md          # Executive summary of all strategies (index)
-├── src/                         # Shared utilities and common code
-└── Strategies/                  # Individual strategy implementations
+├── README.md                              # This file
+├── Financial_thinking.md                  # Theoretical reflections and research notes
+├── Quant_strategies.md                    # Executive summary of all strategies (index)
+├── investment_strategies_classification.md # Classification of strategies by timing dependency
+├── src/                                   # Shared utilities and common code
+└── Strategies/                            # Individual strategy implementations
     └── <strategy_name>/
-        ├── <strategy_name>.md   # Detailed strategy documentation
-        └── src/                 # Strategy-specific code
+        ├── <strategy_name>.md             # Detailed strategy documentation
+        └── src/                           # Strategy-specific code
 ```
 
 ## Main Files
@@ -42,6 +43,17 @@ An index file providing an executive summary of each quantitative strategy explo
   - *Minimal example*: Strategy requires data or infrastructure beyond personal scale (e.g., institutional-grade point-in-time databases, real-time feeds)
   - *Full implementation*: Strategy is testable with publicly available data or synthetic data
 - **Rationale**: Why the chosen implementation level
+
+### [investment_strategies_classification.md](investment_strategies_classification.md)
+
+A classification of algorithmic investment strategies by timing dependency, from ultra-high frequency (microseconds) to strategies without timing dependency. For each category, it provides:
+- **Required precision**: Time scale needed for execution
+- **Suited profile**: Type of investor who can realistically implement the strategy
+- **Strategy tables**: Description and edge source for each strategy
+- **Infrastructure costs**: When applicable, estimated investment required
+- **Verdict**: Accessibility assessment for retail investors
+
+Key insight: a retail investor's edge is not speed but **discipline**, **long horizon**, and **absence of institutional constraints**.
 
 ## Strategies
 
