@@ -1,0 +1,6 @@
+pandas>=3.0.0
+plotly>=6.5.0
+yfinance>=1.1.0
+lxml>=5.0.0
+imageio>=2.37.0
+kaleido>=1.2.0

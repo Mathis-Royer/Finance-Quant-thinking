@@ -1,0 +1,8 @@
+CLAUDE.md
+.venv/
+src/.venv/
+src/cache/
+src/out_market_heatmaps/
+__pycache__/
+.env
+.DS_Store
