@@ -50,6 +50,7 @@ from torch.utils.data import Dataset, DataLoader
 
 from data.synthetic_data import SyntheticDataGenerator
 from data.data_loader import Region, MacroDataLoader
+from data.fred_md_loader import FREDMDLoader, FREDMDConfig, load_fred_md_dataset
 from features.feature_engineering import FeatureEngineer, FeatureConfig
 from models.transformer import FactorAllocationTransformer, SharpeRatioLoss
 from models.execution_gate import ExecutionGate, PortfolioManager
@@ -130,21 +131,32 @@ class FactorAllocationStrategy:
 
     :param region (Region): Target geographic region
     :param config (Dict): Strategy configuration
+    :param use_fred_md (bool): Use FRED-MD data source
+    :param fred_md_indicators (List): Custom FRED-MD indicators
     """
 
     def __init__(
         self,
         region: Region = Region.US,
         config: Optional[Dict] = None,
+        use_fred_md: bool = False,
+        fred_md_indicators: Optional[List] = None,
+        verbose: bool = True,
     ):
         """
         Initialize the strategy.
 
         :param region (Region): Target region
         :param config (Dict): Configuration parameters
+        :param use_fred_md (bool): Use FRED-MD data source
+        :param fred_md_indicators (List): Custom FRED-MD indicators from loader
+        :param verbose (bool): Print progress and metrics
         """
         self.region = region
         self.config = config or self._default_config()
+        self.use_fred_md = use_fred_md
+        self.fred_md_indicators = fred_md_indicators
+        self.verbose = verbose
 
         # Initialize components
         self.feature_engineer = FeatureEngineer(
@@ -152,8 +164,10 @@ class FactorAllocationStrategy:
                 sequence_length=self.config["sequence_length"],
                 include_momentum=True,
                 include_market_context=True,
+                use_fred_md=use_fred_md,
             ),
             region=region,
+            fred_md_indicators=fred_md_indicators,
         )
 
         self.model: Optional[FactorAllocationTransformer] = None
@@ -161,33 +175,39 @@ class FactorAllocationStrategy:
         self.portfolio_manager: Optional[PortfolioManager] = None
 
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        print(f"Using device: {self.device}")
+        if self.verbose:
+            print(f"Using device: {self.device}")
 
     def _default_config(self) -> Dict:
         """
         Default strategy configuration.
 
+        MICRO architecture optimized for ~300 monthly samples:
+        - Minimal model size (<10k params) to prevent overfitting
+        - Single layer, single head attention
+        - Very high dropout for regularization
+
         :return config (Dict): Default parameters
         """
         return {
             # Data parameters
-            "sequence_length": 50,
+            "sequence_length": 12,  # 1 year of monthly data
             "num_factors": 6,
 
-            # Model parameters (minimal as per strategy doc)
-            "d_model": 64,
-            "num_heads": 2,
-            "num_layers": 2,
-            "d_ff": 128,
-            "dropout": 0.4,
+            # Model parameters (MICRO - heavily reduced)
+            "d_model": 32,  # Reduced from 64
+            "num_heads": 1,  # Single head
+            "num_layers": 1,  # Single layer
+            "d_ff": 64,  # Reduced from 128
+            "dropout": 0.6,  # High dropout
 
             # Training parameters
             "learning_rate": 0.001,
             "batch_size": 32,
-            "epochs_phase1": 30,
-            "epochs_phase2": 20,
-            "epochs_phase3": 20,
-            "weight_decay": 0.01,
+            "epochs_phase1": 20,
+            "epochs_phase2": 15,
+            "epochs_phase3": 15,
+            "weight_decay": 0.02,
 
             # Execution parameters
             "execution_threshold": 0.05,
@@ -195,6 +215,9 @@ class FactorAllocationStrategy:
 
             # Validation parameters
             "val_split": 0.2,
+
+            # Periodicity (for metrics calculation)
+            "periods_per_year": 12,  # Monthly data
         }
 
     def create_model(self) -> None:
@@ -222,8 +245,9 @@ class FactorAllocationStrategy:
             num_factors=self.config["num_factors"],
         )
 
-        param_count = self.model.count_parameters()
-        print(f"Model created with {param_count:,} parameters")
+        if self.verbose:
+            param_count = self.model.count_parameters()
+            print(f"Model created with {param_count:,} parameters")
 
     def prepare_data(
         self,
@@ -283,6 +307,7 @@ class FactorAllocationStrategy:
         self,
         train_loader: DataLoader,
         val_loader: DataLoader,
+        verbose: Optional[bool] = None,
     ) -> Dict[str, List[float]]:
         """
         Phase 1: Binary classification (cyclicals vs defensives).
@@ -291,12 +316,15 @@ class FactorAllocationStrategy:
 
         :param train_loader (DataLoader): Training data
         :param val_loader (DataLoader): Validation data
+        :param verbose (bool): Override instance verbose setting
 
         :return history (Dict): Training history
         """
-        print("\n" + "=" * 60)
-        print("PHASE 1: Binary Classification Training")
-        print("=" * 60)
+        verbose = verbose if verbose is not None else self.verbose
+        if verbose:
+            print("\n" + "=" * 60)
+            print("PHASE 1: Binary Classification Training")
+            print("=" * 60)
 
         criterion = nn.BCELoss()
         optimizer = optim.AdamW(
@@ -362,7 +390,7 @@ class FactorAllocationStrategy:
             history["val_loss"].append(val_loss)
             history["val_acc"].append(val_acc)
 
-            if (epoch + 1) % 5 == 0:
+            if verbose and (epoch + 1) % 5 == 0:
                 print(f"Epoch {epoch + 1}/{self.config['epochs_phase1']}: "
                       f"Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}, "
                       f"Val Acc: {val_acc:.4f}")
@@ -373,6 +401,7 @@ class FactorAllocationStrategy:
         self,
         train_loader: DataLoader,
         val_loader: DataLoader,
+        verbose: Optional[bool] = None,
     ) -> Dict[str, List[float]]:
         """
         Phase 2: Regression on relative outperformance score.
@@ -381,12 +410,15 @@ class FactorAllocationStrategy:
 
         :param train_loader (DataLoader): Training data
         :param val_loader (DataLoader): Validation data
+        :param verbose (bool): Override instance verbose setting
 
         :return history (Dict): Training history
         """
-        print("\n" + "=" * 60)
-        print("PHASE 2: Regression Training")
-        print("=" * 60)
+        verbose = verbose if verbose is not None else self.verbose
+        if verbose:
+            print("\n" + "=" * 60)
+            print("PHASE 2: Regression Training")
+            print("=" * 60)
 
         criterion = nn.MSELoss()
         optimizer = optim.AdamW(
@@ -446,7 +478,7 @@ class FactorAllocationStrategy:
             history["val_loss"].append(val_loss)
             history["val_ic"].append(val_ic)
 
-            if (epoch + 1) % 5 == 0:
+            if verbose and (epoch + 1) % 5 == 0:
                 print(f"Epoch {epoch + 1}/{self.config['epochs_phase2']}: "
                       f"Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}, "
                       f"Val IC: {val_ic:.4f}")
@@ -458,6 +490,7 @@ class FactorAllocationStrategy:
         train_loader: DataLoader,
         val_loader: DataLoader,
         factor_returns: np.ndarray,
+        verbose: Optional[bool] = None,
     ) -> Dict[str, List[float]]:
         """
         Phase 3: Sharpe ratio optimization with turnover penalty.
@@ -467,12 +500,15 @@ class FactorAllocationStrategy:
         :param train_loader (DataLoader): Training data
         :param val_loader (DataLoader): Validation data
         :param factor_returns (np.ndarray): Historical factor returns
+        :param verbose (bool): Override instance verbose setting
 
         :return history (Dict): Training history
         """
-        print("\n" + "=" * 60)
-        print("PHASE 3: Sharpe Ratio Optimization")
-        print("=" * 60)
+        verbose = verbose if verbose is not None else self.verbose
+        if verbose:
+            print("\n" + "=" * 60)
+            print("PHASE 3: Sharpe Ratio Optimization")
+            print("=" * 60)
 
         criterion = SharpeRatioLoss(
             gamma=1.0,
@@ -485,12 +521,12 @@ class FactorAllocationStrategy:
         )
 
         history = {"train_loss": [], "val_sharpe": []}
-        prev_weights = None
 
         for epoch in range(self.config["epochs_phase3"]):
             # Training
             self.model.train()
             train_loss = 0.0
+            prev_weights = None
 
             for i, (macro_batch, market_context, _) in enumerate(train_loader):
                 macro_batch = {k: v.to(self.device) for k, v in macro_batch.items()}
@@ -506,7 +542,10 @@ class FactorAllocationStrategy:
 
                 optimizer.zero_grad()
                 weights = self.model(macro_batch, market_context, output_type="allocation")
-                loss = criterion(weights, batch_returns, prev_weights)
+
+                # Only use prev_weights if batch sizes match
+                use_prev = prev_weights if (prev_weights is not None and prev_weights.size(0) == weights.size(0)) else None
+                loss = criterion(weights, batch_returns, use_prev)
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
                 optimizer.step()
@@ -517,7 +556,7 @@ class FactorAllocationStrategy:
             train_loss /= len(train_loader)
             history["train_loss"].append(train_loss)
 
-            if (epoch + 1) % 5 == 0:
+            if verbose and (epoch + 1) % 5 == 0:
                 print(f"Epoch {epoch + 1}/{self.config['epochs_phase3']}: "
                       f"Train Loss: {train_loss:.4f}")
 
@@ -529,7 +568,8 @@ class FactorAllocationStrategy:
         factor_data: pd.DataFrame,
         market_data: pd.DataFrame,
         target_data: pd.DataFrame,
-        output_type: str = "binary",
+        output_type: str = "allocation",
+        verbose: Optional[bool] = None,
     ) -> Dict[str, np.ndarray]:
         """
         Run walk-forward backtest.
@@ -538,13 +578,16 @@ class FactorAllocationStrategy:
         :param factor_data (pd.DataFrame): Factor returns
         :param market_data (pd.DataFrame): Market context
         :param target_data (pd.DataFrame): Targets
-        :param output_type (str): Model output type
+        :param output_type (str): Model output type ('binary', 'allocation')
+        :param verbose (bool): Override instance verbose setting
 
         :return results (Dict): Backtest results
         """
-        print("\n" + "=" * 60)
-        print("RUNNING BACKTEST")
-        print("=" * 60)
+        verbose = verbose if verbose is not None else self.verbose
+        if verbose:
+            print("\n" + "=" * 60)
+            print(f"RUNNING BACKTEST (mode: {output_type})")
+            print("=" * 60)
 
         self.model.eval()
         self.portfolio_manager.reset()
@@ -553,6 +596,10 @@ class FactorAllocationStrategy:
         actuals = []
         portfolio_returns = []
         timestamps = []
+        all_weights = []  # Track all factor weights
+
+        # Factor columns for multi-factor allocation
+        factor_columns = ["cyclical", "defensive", "value", "growth", "quality", "momentum"]
 
         with torch.no_grad():
             for _, row in target_data.iterrows():
@@ -571,49 +618,80 @@ class FactorAllocationStrategy:
                 }
                 market_tensor = torch.tensor(market_ctx, dtype=torch.float32).unsqueeze(0).to(self.device)
 
-                # Get prediction
-                output = self.model(macro_tensor, market_tensor, output_type=output_type)
-                pred = output.cpu().numpy().flatten()[0]
+                # Get factor returns for this period
+                factor_row = factor_data[factor_data["timestamp"] == as_of_date]
 
-                predictions.append(pred)
-                actuals.append(row["target"])
+                if output_type == "allocation":
+                    # Multi-factor allocation: use all 6 factor weights
+                    output = self.model(macro_tensor, market_tensor, output_type="allocation")
+                    weights = output.cpu().numpy().flatten()  # [6] weights summing to 1
+                    all_weights.append(weights)
 
-                # Simulate portfolio returns (simplified)
-                if output_type == "binary":
-                    # Long cyclical if pred > 0.5, else long defensive
-                    if pred > 0.5:
-                        factor_idx = available_factors.index("cyclical") if "cyclical" in available_factors else 0
-                    else:
-                        factor_idx = available_factors.index("defensive") if "defensive" in available_factors else 1
+                    # Binary prediction based on cyclical vs defensive weight
+                    pred = weights[0] / (weights[0] + weights[1] + 1e-8)  # cyclical / (cyclical + defensive)
+                    predictions.append(pred)
+                    actuals.append(row["target"])
 
-                    # Get factor return for this period
-                    factor_row = factor_data[factor_data["timestamp"] == as_of_date]
+                    # Portfolio return = weighted sum of all factor returns
                     if len(factor_row) > 0:
-                        portfolio_returns.append(factor_row.iloc[0].get("cyclical" if pred > 0.5 else "defensive", 0))
+                        factor_returns = factor_row[factor_columns].values.flatten()
+                        portfolio_return = np.dot(weights, factor_returns)
+                        portfolio_returns.append(portfolio_return)
                     else:
                         portfolio_returns.append(0.0)
 
-        return {
+                elif output_type == "binary":
+                    # Binary mode: only cyclical vs defensive (legacy)
+                    output = self.model(macro_tensor, market_tensor, output_type="binary")
+                    pred = output.cpu().numpy().flatten()[0]
+                    predictions.append(pred)
+                    actuals.append(row["target"])
+
+                    # Equal weight to cyclical or defensive
+                    if len(factor_row) > 0:
+                        if pred > 0.5:
+                            portfolio_returns.append(factor_row.iloc[0].get("cyclical", 0))
+                        else:
+                            portfolio_returns.append(factor_row.iloc[0].get("defensive", 0))
+                    else:
+                        portfolio_returns.append(0.0)
+
+        results = {
             "predictions": np.array(predictions),
             "actuals": np.array(actuals),
             "portfolio_returns": np.array(portfolio_returns),
             "timestamps": timestamps,
         }
 
-    def evaluate(self, results: Dict[str, np.ndarray]) -> Dict[str, float]:
+        # Add weights history for multi-factor mode
+        if output_type == "allocation" and all_weights:
+            results["weights"] = np.array(all_weights)
+            results["factor_columns"] = factor_columns
+
+        return results
+
+    def evaluate(
+        self,
+        results: Dict[str, np.ndarray],
+        verbose: Optional[bool] = None,
+    ) -> Dict[str, float]:
         """
         Evaluate backtest results.
 
         :param results (Dict): Backtest results
+        :param verbose (bool): Override instance verbose setting
 
         :return metrics (Dict): Performance metrics
         """
+        verbose = verbose if verbose is not None else self.verbose
         predictions = results["predictions"]
         actuals = results["actuals"]
         portfolio_returns = results.get("portfolio_returns", np.array([]))
 
+        # Use periods_per_year=12 for monthly data
         report = PerformanceMetrics.full_evaluation(
-            predictions, actuals, portfolio_returns if len(portfolio_returns) > 0 else None
+            predictions, actuals, portfolio_returns if len(portfolio_returns) > 0 else None,
+            periods_per_year=12,
         )
 
         metrics = {
@@ -626,38 +704,92 @@ class FactorAllocationStrategy:
             "win_rate": report.win_rate,
         }
 
-        print("\n" + "-" * 40)
-        print("PERFORMANCE METRICS:")
-        for name, value in metrics.items():
-            print(f"  {name}: {value:.4f}")
-        print("-" * 40)
+        if verbose:
+            print("\n" + "-" * 40)
+            print("PERFORMANCE METRICS:")
+            for name, value in metrics.items():
+                print(f"  {name}: {value:.4f}")
+            print("-" * 40)
+
+        # Multi-factor allocation analysis
+        if "weights" in results:
+            weights = results["weights"]
+            factor_columns = results.get("factor_columns", available_factors)
+
+            # Compute metrics even if not verbose
+            avg_weights = weights.mean(axis=0)
+            weight_std = weights.std(axis=0)
+
+            if len(weights) > 1:
+                weight_changes = np.abs(np.diff(weights, axis=0))
+                avg_turnover = weight_changes.sum(axis=1).mean()
+                metrics["avg_turnover"] = avg_turnover
+
+            hhi = (weights ** 2).sum(axis=1).mean()
+            metrics["concentration_hhi"] = hhi
+
+            # Store avg weights in metrics for later access
+            for i, col in enumerate(factor_columns):
+                metrics[f"weight_{col}"] = avg_weights[i]
+
+            if verbose:
+                print("\nFACTOR ALLOCATION ANALYSIS:")
+                print("-" * 40)
+
+                print("Average weights:")
+                for i, col in enumerate(factor_columns):
+                    print(f"  {col}: {avg_weights[i]:.2%}")
+
+                print("\nWeight volatility (std):")
+                for i, col in enumerate(factor_columns):
+                    print(f"  {col}: {weight_std[i]:.4f}")
+
+                if "avg_turnover" in metrics:
+                    print(f"\nAverage monthly turnover: {metrics['avg_turnover']:.2%}")
+
+                print(f"Concentration (HHI): {hhi:.4f} (1/6 = {1/6:.4f} for equal weight)")
+                print("-" * 40)
 
         return metrics
 
     def save_model(self, path: str) -> None:
         """
-        Save model checkpoint.
+        Save model checkpoint with horizon metadata.
 
         :param path (str): Save path
         """
+        from datetime import datetime
+
         torch.save({
             "model_state_dict": self.model.state_dict(),
             "config": self.config,
             "region": self.region.value,
+            "horizon_months": self.config.get("horizon_months", 1),
+            "saved_at": datetime.now().isoformat(),
         }, path)
-        print(f"Model saved to {path}")
+        if self.verbose:
+            horizon = self.config.get("horizon_months", 1)
+            print(f"Model saved to {path} (horizon: {horizon}M)")
 
     def load_model(self, path: str) -> None:
         """
-        Load model checkpoint.
+        Load model checkpoint with horizon validation.
 
         :param path (str): Checkpoint path
         """
         checkpoint = torch.load(path, map_location=self.device)
+
+        # Validate horizon if specified in current config
+        saved_horizon = checkpoint.get("horizon_months", 1)
+        current_horizon = self.config.get("horizon_months", 1)
+        if saved_horizon != current_horizon:
+            print(f"Warning: Loading {saved_horizon}M model into {current_horizon}M config")
+
         self.config = checkpoint["config"]
         self.create_model()
         self.model.load_state_dict(checkpoint["model_state_dict"])
-        print(f"Model loaded from {path}")
+        if self.verbose:
+            print(f"Model loaded from {path} (horizon: {saved_horizon}M)")
 
 
 def main():
@@ -671,6 +803,17 @@ def main():
                        help="Target region")
     parser.add_argument("--seed", type=int, default=42,
                        help="Random seed")
+    parser.add_argument("--data-source", type=str, default="synthetic",
+                       choices=["synthetic", "fred-md"],
+                       help="Data source (synthetic for testing, fred-md for real data)")
+    parser.add_argument("--cache-dir", type=str, default=None,
+                       help="Directory to cache FRED-MD data")
+    parser.add_argument("--start-date", type=str, default="1990-01-01",
+                       help="Start date for data (FRED-MD)")
+    parser.add_argument("--end-date", type=str, default="2024-12-31",
+                       help="End date for data (FRED-MD)")
+    parser.add_argument("--local-file", type=str, default=None,
+                       help="Path to local FRED-MD CSV file (for manual download)")
 
     args = parser.parse_args()
 
@@ -691,25 +834,58 @@ def main():
     print("=" * 60)
     print(f"Mode: {args.mode}")
     print(f"Region: {region.value}")
+    print(f"Data Source: {args.data_source}")
     print(f"Seed: {args.seed}")
     print("=" * 60)
 
-    # Generate synthetic data for testing
-    print("\nGenerating synthetic data...")
-    generator = SyntheticDataGenerator(region=region, seed=args.seed)
-    macro_data, factor_data, market_data = generator.generate_dataset(
-        start_date="2000-01-01",
-        end_date="2024-12-31",
-        freq="W",
-    )
+    # Load data based on source
+    use_fred_md = args.data_source == "fred-md"
+    fred_md_indicators = None
 
-    # Create targets
-    target_data = generator.create_binary_target(factor_data, horizon_weeks=4)
-    print(f"Generated {len(macro_data)} macro observations")
-    print(f"Generated {len(target_data)} target observations")
+    if use_fred_md:
+        print("\nLoading FRED-MD data...")
+        macro_data, market_data, fred_md_indicators = load_fred_md_dataset(
+            start_date=args.start_date,
+            end_date=args.end_date,
+            cache_dir=args.cache_dir,
+            local_file=args.local_file,
+        )
+
+        # Generate synthetic factor returns for now (FRED-MD doesn't include factor returns)
+        # In production, you would load these from Kenneth French Library or similar
+        print("\nGenerating synthetic factor returns for training...")
+        generator = SyntheticDataGenerator(region=region, seed=args.seed)
+        _, factor_data, _ = generator.generate_dataset(
+            start_date=args.start_date,
+            end_date=args.end_date,
+            freq="ME",  # Monthly (month-end) to match FRED-MD
+        )
+
+        # Create targets using synthetic factor data
+        target_data = generator.create_binary_target(factor_data, horizon_weeks=4)
+        print(f"Loaded {len(macro_data)} macro observations from FRED-MD")
+        print(f"Generated {len(target_data)} target observations")
+    else:
+        # Generate synthetic data for testing
+        print("\nGenerating synthetic data...")
+        generator = SyntheticDataGenerator(region=region, seed=args.seed)
+        macro_data, factor_data, market_data = generator.generate_dataset(
+            start_date="2000-01-01",
+            end_date="2024-12-31",
+            freq="W",
+        )
+
+        # Create targets
+        target_data = generator.create_binary_target(factor_data, horizon_weeks=4)
+        print(f"Generated {len(macro_data)} macro observations")
+        print(f"Generated {len(target_data)} target observations")
 
     # Initialize strategy
-    strategy = FactorAllocationStrategy(region=region)
+    strategy = FactorAllocationStrategy(
+        region=region,
+        use_fred_md=use_fred_md,
+        fred_md_indicators=fred_md_indicators,
+    )
     strategy.create_model()
 
     if args.mode == "demo":

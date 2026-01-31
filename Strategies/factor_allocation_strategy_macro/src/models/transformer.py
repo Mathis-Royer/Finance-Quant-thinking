@@ -1,14 +1,16 @@
 """
 Transformer model for factor allocation prediction.
 
-This module implements a minimal Transformer architecture as specified
-in the strategy document, with:
-- 2-4 layers
-- 64-128 embedding dimension
-- 2-4 attention heads
-- High dropout (0.3-0.5)
+This module implements a MICRO Transformer architecture optimized for
+small datasets (~300 monthly samples). Key design choices:
+- 1 layer only (minimize overfitting)
+- 32 embedding dimension (reduced from 64-128)
+- 1 attention head (simplest attention)
+- Very high dropout (0.6)
 - Causal masking
 - Relative positional encoding
+
+Target: <10k parameters to avoid overfitting on limited macro data.
 """
 
 from typing import Dict, Optional, Tuple
@@ -36,7 +38,7 @@ class MultiHeadAttention(nn.Module):
         self,
         d_model: int,
         num_heads: int,
-        dropout: float = 0.3,
+        dropout: float = 0.6,
         use_temporal_decay: bool = True,
     ):
         """
@@ -154,7 +156,7 @@ class TransformerBlock(nn.Module):
         d_model: int,
         num_heads: int,
         d_ff: int,
-        dropout: float = 0.3,
+        dropout: float = 0.6,
     ):
         """
         Initialize Transformer block.
@@ -228,11 +230,11 @@ class FactorAllocationTransformer(nn.Module):
         self,
         num_indicators: int,
         num_factors: int = 6,
-        d_model: int = 64,
-        num_heads: int = 2,
-        num_layers: int = 2,
-        d_ff: int = 128,
-        dropout: float = 0.4,
+        d_model: int = 32,
+        num_heads: int = 1,
+        num_layers: int = 1,
+        d_ff: int = 64,
+        dropout: float = 0.6,
         max_seq_len: int = 100,
     ):
         """
@@ -274,13 +276,8 @@ class FactorAllocationTransformer(nn.Module):
         # Regression head (phase 2)
         self.regression_head = nn.Linear(d_model, 1)
 
-        # Full allocation head (phase 3)
-        self.allocation_head = nn.Sequential(
-            nn.Linear(d_model, d_model),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(d_model, num_factors),
-        )
+        # Full allocation head (phase 3) - simplified to single linear layer
+        self.allocation_head = nn.Linear(d_model, num_factors)
 
         # Causal mask buffer
         self.register_buffer(
@@ -385,32 +382,131 @@ class FactorAllocationTransformer(nn.Module):
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
 
 
+class BaselineRegularization(nn.Module):
+    """
+    Regularization toward a simple baseline model (ridge regression).
+
+    As per strategy document Section 1.4.3:
+    "Baseline regularization: Loss term penalizing deviations from a simple
+    econometric model (ridge regression)"
+
+    This helps inject prior economic knowledge by keeping the model
+    close to a simple linear baseline, reducing overfitting.
+
+    :param num_features (int): Number of input features for baseline
+    :param num_outputs (int): Number of outputs (factors)
+    :param alpha (float): Ridge regularization strength
+    """
+
+    def __init__(
+        self,
+        num_features: int,
+        num_outputs: int = 6,
+        alpha: float = 1.0,
+    ):
+        """
+        Initialize baseline regularization.
+
+        :param num_features (int): Input feature dimension
+        :param num_outputs (int): Output dimension
+        :param alpha (float): Ridge penalty strength
+        """
+        super().__init__()
+        self.alpha = alpha
+
+        # Simple linear baseline (ridge regression)
+        self.baseline = nn.Linear(num_features, num_outputs)
+
+        # Initialize with small weights
+        nn.init.xavier_uniform_(self.baseline.weight, gain=0.1)
+        nn.init.zeros_(self.baseline.bias)
+
+    def forward(
+        self,
+        model_output: torch.Tensor,
+        features: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Compute regularization loss.
+
+        :param model_output (torch.Tensor): Model predictions [batch, num_outputs]
+        :param features (torch.Tensor): Input features for baseline [batch, num_features]
+
+        :return reg_loss (torch.Tensor): Regularization loss
+        """
+        # Baseline prediction (no gradient through baseline)
+        with torch.no_grad():
+            baseline_pred = self.baseline(features)
+
+        # MSE between model output and baseline
+        deviation = (model_output - baseline_pred).pow(2).mean()
+
+        # Ridge penalty on baseline weights
+        ridge_penalty = self.baseline.weight.pow(2).mean()
+
+        return deviation + self.alpha * ridge_penalty
+
+    def fit_baseline(
+        self,
+        features: torch.Tensor,
+        targets: torch.Tensor,
+        lr: float = 0.01,
+        epochs: int = 100,
+    ) -> None:
+        """
+        Fit the baseline model on training data.
+
+        :param features (torch.Tensor): Input features [n_samples, num_features]
+        :param targets (torch.Tensor): Target values [n_samples, num_outputs]
+        :param lr (float): Learning rate
+        :param epochs (int): Number of epochs
+        """
+        optimizer = torch.optim.Adam(self.baseline.parameters(), lr=lr)
+        criterion = nn.MSELoss()
+
+        for _ in range(epochs):
+            optimizer.zero_grad()
+            pred = self.baseline(features)
+            loss = criterion(pred, targets) + self.alpha * self.baseline.weight.pow(2).mean()
+            loss.backward()
+            optimizer.step()
+
+
 class SharpeRatioLoss(nn.Module):
     """
     Differentiable approximation of negative Sharpe ratio loss.
 
-    Loss = -E[R] + gamma * Var[R] + lambda * turnover
+    Loss = -E[R] + gamma * Var[R] + lambda * turnover + beta * baseline_deviation
 
     :param gamma (float): Risk aversion coefficient
-    :param turnover_penalty (float): Turnover penalty coefficient
+    :param turnover_penalty (float): Turnover penalty coefficient (calibrated)
+    :param baseline_penalty (float): Baseline regularization penalty
     """
 
-    def __init__(self, gamma: float = 1.0, turnover_penalty: float = 0.01):
+    def __init__(
+        self,
+        gamma: float = 1.0,
+        turnover_penalty: float = 0.01,
+        baseline_penalty: float = 0.0,
+    ):
         """
         Initialize Sharpe ratio loss.
 
         :param gamma (float): Risk aversion (higher = more risk-averse)
         :param turnover_penalty (float): Penalty for weight changes
+        :param baseline_penalty (float): Penalty for deviation from baseline
         """
         super().__init__()
         self.gamma = gamma
         self.turnover_penalty = turnover_penalty
+        self.baseline_penalty = baseline_penalty
 
     def forward(
         self,
         weights: torch.Tensor,
         returns: torch.Tensor,
         prev_weights: Optional[torch.Tensor] = None,
+        baseline_deviation: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Compute Sharpe-based loss.
@@ -418,6 +514,7 @@ class SharpeRatioLoss(nn.Module):
         :param weights (torch.Tensor): Predicted weights [batch, num_factors]
         :param returns (torch.Tensor): Factor returns [batch, num_factors]
         :param prev_weights (Optional[torch.Tensor]): Previous weights for turnover
+        :param baseline_deviation (Optional[torch.Tensor]): Deviation from baseline
 
         :return loss (torch.Tensor): Scalar loss
         """
@@ -436,4 +533,42 @@ class SharpeRatioLoss(nn.Module):
             turnover = torch.abs(weights - prev_weights).sum(dim=-1).mean()
             loss = loss + self.turnover_penalty * turnover
 
+        # Baseline regularization
+        if baseline_deviation is not None and self.baseline_penalty > 0:
+            loss = loss + self.baseline_penalty * baseline_deviation
+
         return loss
+
+
+def calibrate_turnover_penalty(
+    transaction_cost_bps: float = 10.0,
+    expected_turnover: float = 0.3,
+    holding_period_months: int = 1,
+) -> float:
+    """
+    Calibrate turnover penalty based on transaction costs.
+
+    As per strategy document Section 1.5.2:
+    "The coefficient λ must be calibrated based on actual transaction costs."
+
+    :param transaction_cost_bps (float): One-way transaction cost in basis points
+    :param expected_turnover (float): Expected monthly turnover (0-1)
+    :param holding_period_months (int): Average holding period
+
+    :return lambda_penalty (float): Calibrated turnover penalty
+    """
+    # Convert bps to decimal
+    tc_decimal = transaction_cost_bps / 10000.0
+
+    # Two-way cost (buy + sell)
+    two_way_cost = 2 * tc_decimal
+
+    # Annualized cost impact
+    annual_trades = 12 / holding_period_months
+    annual_cost = two_way_cost * expected_turnover * annual_trades
+
+    # Scale to match Sharpe ratio magnitude (typical Sharpe ~0.5-1.0)
+    # Penalty should make turnover cost visible in loss
+    lambda_penalty = annual_cost * 10.0
+
+    return lambda_penalty

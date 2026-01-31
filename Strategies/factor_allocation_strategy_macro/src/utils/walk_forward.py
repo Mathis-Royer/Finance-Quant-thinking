@@ -145,6 +145,66 @@ class WalkForwardValidator:
 
         return windows
 
+    def create_expanding_windows_for_horizon(
+        self,
+        data_start: str,
+        data_end: str,
+        horizon_months: int,
+        initial_train_years: int = 14,
+        val_years: int = 3,
+        step_years: int = 1,
+    ) -> List[WalkForwardWindow]:
+        """
+        Create expanding windows accounting for prediction horizon lookahead.
+
+        For longer horizons, ensures that the test period has enough
+        data after the last observation for cumulative return computation.
+        Also adds a gap between train/val to prevent lookahead bias.
+
+        :param data_start (str): Data start date
+        :param data_end (str): Data end date
+        :param horizon_months (int): Prediction horizon (1, 3, 6, or 12)
+        :param initial_train_years (int): Initial training period
+        :param val_years (int): Validation period length
+        :param step_years (int): Step size between windows
+
+        :return windows (List[WalkForwardWindow]): Horizon-adjusted windows
+        """
+        windows = []
+        start = pd.Timestamp(data_start)
+        end = pd.Timestamp(data_end)
+
+        # Compute effective data end accounting for horizon lookahead
+        # Need horizon_months of data AFTER last test observation
+        horizon_buffer_months = horizon_months - 1
+        effective_end = end - pd.DateOffset(months=horizon_buffer_months)
+
+        train_end_year = start.year + initial_train_years - 1
+
+        while True:
+            train_end = pd.Timestamp(f"{train_end_year}-12-31")
+            val_start = pd.Timestamp(f"{train_end_year + 1}-01-01")
+            val_end = pd.Timestamp(f"{train_end_year + val_years}-12-31")
+            test_start = pd.Timestamp(f"{train_end_year + val_years + 1}-01-01")
+
+            # Use effective_end instead of data_end for test period
+            if test_start >= effective_end:
+                break
+
+            window = WalkForwardWindow(
+                train_start=data_start,
+                train_end=str(train_end.date()),
+                val_start=str(val_start.date()),
+                val_end=str(val_end.date()),
+                test_start=str(test_start.date()),
+                test_end=str(effective_end.date()),
+            )
+            windows.append(window)
+
+            train_end_year += step_years
+
+        return windows
+
     def split_data(
         self,
         data: pd.DataFrame,

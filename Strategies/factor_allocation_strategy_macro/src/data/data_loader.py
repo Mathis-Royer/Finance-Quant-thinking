@@ -141,6 +141,15 @@ class Region(Enum):
     EMERGING = "emerging"
 
 
+class Periodicity(Enum):
+    """Publication frequency for macroeconomic indicators."""
+    DAILY = "daily"
+    WEEKLY = "weekly"
+    MONTHLY = "monthly"
+    QUARTERLY = "quarterly"
+    IRREGULAR = "irregular"
+
+
 @dataclass
 class MacroIndicator:
     """
@@ -212,6 +221,7 @@ class MacroDataLoader:
 
     :param region (Region): Target region for data loading
     :param sequence_length (int): Number of tokens in input sequence
+    :param use_fred_md (bool): Use FRED-MD indicator definitions
     """
 
     # Standard macro indicators per region
@@ -257,16 +267,115 @@ class MacroDataLoader:
         ],
     }
 
-    def __init__(self, region: Region, sequence_length: int = 50):
+    # FRED-MD indicator definitions (key series from the ~130 available)
+    FRED_MD_INDICATORS: List[MacroIndicator] = [
+        # Output and Income
+        MacroIndicator("RPI", MacroCategory.ECONOMIC_ACTIVITY, Region.US, 2, "monthly"),
+        MacroIndicator("W875RX1", MacroCategory.ECONOMIC_ACTIVITY, Region.US, 2, "monthly"),
+        MacroIndicator("INDPRO", MacroCategory.ECONOMIC_ACTIVITY, Region.US, 3, "monthly"),
+        MacroIndicator("IPFPNSS", MacroCategory.ECONOMIC_ACTIVITY, Region.US, 2, "monthly"),
+        MacroIndicator("IPFINAL", MacroCategory.ECONOMIC_ACTIVITY, Region.US, 2, "monthly"),
+        MacroIndicator("IPCONGD", MacroCategory.CONSUMPTION, Region.US, 2, "monthly"),
+        MacroIndicator("IPBUSEQ", MacroCategory.ECONOMIC_ACTIVITY, Region.US, 2, "monthly"),
+        MacroIndicator("CUMFNS", MacroCategory.ECONOMIC_ACTIVITY, Region.US, 2, "monthly"),
+
+        # Labor Market
+        MacroIndicator("CLF16OV", MacroCategory.EMPLOYMENT, Region.US, 2, "monthly"),
+        MacroIndicator("CE16OV", MacroCategory.EMPLOYMENT, Region.US, 2, "monthly"),
+        MacroIndicator("UNRATE", MacroCategory.EMPLOYMENT, Region.US, 3, "monthly"),
+        MacroIndicator("UEMPMEAN", MacroCategory.EMPLOYMENT, Region.US, 2, "monthly"),
+        MacroIndicator("CLAIMSx", MacroCategory.EMPLOYMENT, Region.US, 3, "monthly"),
+        MacroIndicator("PAYEMS", MacroCategory.EMPLOYMENT, Region.US, 3, "monthly"),
+        MacroIndicator("USGOOD", MacroCategory.EMPLOYMENT, Region.US, 2, "monthly"),
+        MacroIndicator("MANEMP", MacroCategory.EMPLOYMENT, Region.US, 2, "monthly"),
+        MacroIndicator("SRVPRD", MacroCategory.EMPLOYMENT, Region.US, 2, "monthly"),
+        MacroIndicator("AWHMAN", MacroCategory.EMPLOYMENT, Region.US, 2, "monthly"),
+
+        # Housing
+        MacroIndicator("HOUST", MacroCategory.HOUSING, Region.US, 3, "monthly"),
+        MacroIndicator("HOUSTNE", MacroCategory.HOUSING, Region.US, 2, "monthly"),
+        MacroIndicator("HOUSTMW", MacroCategory.HOUSING, Region.US, 2, "monthly"),
+        MacroIndicator("HOUSTS", MacroCategory.HOUSING, Region.US, 2, "monthly"),
+        MacroIndicator("HOUSTW", MacroCategory.HOUSING, Region.US, 2, "monthly"),
+        MacroIndicator("PERMIT", MacroCategory.HOUSING, Region.US, 2, "monthly"),
+
+        # Consumption and Orders
+        MacroIndicator("DPCERA3M086SBEA", MacroCategory.CONSUMPTION, Region.US, 2, "monthly"),
+        MacroIndicator("CMRMTSPLx", MacroCategory.CONSUMPTION, Region.US, 2, "monthly"),
+        MacroIndicator("RETAILx", MacroCategory.CONSUMPTION, Region.US, 3, "monthly"),
+        MacroIndicator("AMDMNOx", MacroCategory.ECONOMIC_ACTIVITY, Region.US, 2, "monthly"),
+        MacroIndicator("BUSINVx", MacroCategory.ECONOMIC_ACTIVITY, Region.US, 2, "monthly"),
+        MacroIndicator("UMCSENTx", MacroCategory.SENTIMENT, Region.US, 3, "monthly"),
+
+        # Money and Credit
+        MacroIndicator("M1SL", MacroCategory.MONETARY_POLICY, Region.US, 2, "monthly"),
+        MacroIndicator("M2SL", MacroCategory.MONETARY_POLICY, Region.US, 3, "monthly"),
+        MacroIndicator("M2REAL", MacroCategory.MONETARY_POLICY, Region.US, 2, "monthly"),
+        MacroIndicator("BUSLOANS", MacroCategory.MONETARY_POLICY, Region.US, 2, "monthly"),
+        MacroIndicator("CONSPI", MacroCategory.MONETARY_POLICY, Region.US, 2, "monthly"),
+
+        # Interest Rates
+        MacroIndicator("FEDFUNDS", MacroCategory.MONETARY_POLICY, Region.US, 3, "monthly"),
+        MacroIndicator("TB3MS", MacroCategory.MONETARY_POLICY, Region.US, 2, "monthly"),
+        MacroIndicator("TB6MS", MacroCategory.MONETARY_POLICY, Region.US, 2, "monthly"),
+        MacroIndicator("GS1", MacroCategory.MONETARY_POLICY, Region.US, 2, "monthly"),
+        MacroIndicator("GS5", MacroCategory.MONETARY_POLICY, Region.US, 2, "monthly"),
+        MacroIndicator("GS10", MacroCategory.MONETARY_POLICY, Region.US, 3, "monthly"),
+        MacroIndicator("AAA", MacroCategory.MONETARY_POLICY, Region.US, 2, "monthly"),
+        MacroIndicator("BAA", MacroCategory.MONETARY_POLICY, Region.US, 2, "monthly"),
+        MacroIndicator("T10YFFM", MacroCategory.MONETARY_POLICY, Region.US, 2, "monthly"),
+        MacroIndicator("BAAFFM", MacroCategory.MONETARY_POLICY, Region.US, 2, "monthly"),
+
+        # Exchange Rates
+        MacroIndicator("TWEXMMTH", MacroCategory.TRADE, Region.US, 2, "monthly"),
+        MacroIndicator("EXJPUSx", MacroCategory.TRADE, Region.US, 2, "monthly"),
+        MacroIndicator("EXUSUKx", MacroCategory.TRADE, Region.US, 2, "monthly"),
+
+        # Prices
+        MacroIndicator("WPSFD49207", MacroCategory.INFLATION, Region.US, 2, "monthly"),
+        MacroIndicator("PPICMM", MacroCategory.INFLATION, Region.US, 2, "monthly"),
+        MacroIndicator("CPIAUCSL", MacroCategory.INFLATION, Region.US, 3, "monthly"),
+        MacroIndicator("CPIAPPSL", MacroCategory.INFLATION, Region.US, 2, "monthly"),
+        MacroIndicator("CPITRNSL", MacroCategory.INFLATION, Region.US, 2, "monthly"),
+        MacroIndicator("CPIMEDSL", MacroCategory.INFLATION, Region.US, 2, "monthly"),
+        MacroIndicator("CPIULFSL", MacroCategory.INFLATION, Region.US, 2, "monthly"),
+        MacroIndicator("PCEPI", MacroCategory.INFLATION, Region.US, 2, "monthly"),
+        MacroIndicator("OILPRICEx", MacroCategory.INFLATION, Region.US, 2, "monthly"),
+
+        # Stock Market
+        MacroIndicator("S&P 500", MacroCategory.SENTIMENT, Region.US, 3, "monthly"),
+        MacroIndicator("S&P: indust", MacroCategory.SENTIMENT, Region.US, 2, "monthly"),
+        MacroIndicator("S&P div yield", MacroCategory.SENTIMENT, Region.US, 2, "monthly"),
+        MacroIndicator("S&P PE ratio", MacroCategory.SENTIMENT, Region.US, 2, "monthly"),
+        MacroIndicator("VXOCLSx", MacroCategory.SENTIMENT, Region.US, 3, "monthly"),
+    ]
+
+    def __init__(
+        self,
+        region: Region,
+        sequence_length: int = 50,
+        use_fred_md: bool = False,
+        fred_md_indicators: Optional[List[MacroIndicator]] = None,
+    ):
         """
         Initialize the data loader.
 
         :param region (Region): Target region
         :param sequence_length (int): Number of tokens per sequence
+        :param use_fred_md (bool): Use FRED-MD indicator definitions
+        :param fred_md_indicators (List[MacroIndicator]): Custom FRED-MD indicators
         """
         self.region = region
         self.sequence_length = sequence_length
-        self.indicators = self.INDICATOR_DEFINITIONS.get(region, [])
+        self.use_fred_md = use_fred_md
+
+        if use_fred_md:
+            if fred_md_indicators:
+                self.indicators = fred_md_indicators
+            else:
+                self.indicators = self.FRED_MD_INDICATORS
+        else:
+            self.indicators = self.INDICATOR_DEFINITIONS.get(region, [])
 
     def load_macro_sequence(
         self,

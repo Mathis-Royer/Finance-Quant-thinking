@@ -2,7 +2,9 @@
 
 ## Executive Summary
 
-This document describes a dynamic allocation strategy across equity categories (factor styles) using a Transformer-based model fed by real-time macroeconomic data. The goal is to maximize risk-adjusted performance by anticipating style rotations (value, growth, cyclical, defensive, etc.) from macro signals. A separate model and portfolio is maintained for each geographic region, allowing the allocation of the appropriate portfolio to be adjusted based on the region of the incoming data.
+This document describes a dynamic allocation strategy across equity factor styles using a Transformer-based model fed by point-in-time macroeconomic data. The goal is to maximize risk-adjusted performance by anticipating style rotations (cyclical, defensive, value, growth, quality, momentum) from macro signals.
+
+**Current Implementation Status**: Research/Development phase with a MICRO Transformer architecture (12k parameters) trained on Point-in-Time FRED-MD data (305 vintage files, 112 indicators).
 
 ---
 
@@ -10,323 +12,340 @@ This document describes a dynamic allocation strategy across equity categories (
 
 ### 1.1 Objective
 
-The objective is to develop a neural network model that takes daily fundamental macroeconomic data as input and produces allocation weights across equity categories, with the goal of maximizing performance and the Sharpe ratio over different time horizons (1 week, 1 month, 3 months, 6 months, 1 year).
+The objective is to develop a neural network model that takes monthly macroeconomic data as input and produces allocation weights across 6 factor categories, with the goal of maximizing risk-adjusted performance over different time horizons (1 month, 3 months, 6 months, 12 months).
 
-The performance of each category is calculated as the capitalization-weighted average of the stocks composing that category. Target categories are defined by established factor indices (MSCI Factor Indices, S&P Pure Style Indices) to ensure a standardized definition and consistent historical track record.
+**Target Factor Categories**:
 
-A key architectural decision is to train one model per geographic region (US, Europe, Japan, etc.), each managing its own dedicated portfolio. When new macroeconomic data arrives, the system identifies the relevant region and updates only the corresponding regional model and portfolio. This regional separation ensures that the model learns relationships specific to each economic zone, since the link between macro indicators and factor performance can differ significantly across regions.
+| Factor | Description | Proxy ETFs |
+|--------|-------------|------------|
+| Cyclical | Economically sensitive sectors | XLY, XLI, XLF |
+| Defensive | Stable, low-beta sectors | XLP, XLU, XLV |
+| Value | Low P/E, high dividend stocks | IWD, VTV |
+| Growth | High growth expectations | IWF, VUG |
+| Quality | High profitability, low debt | QUAL |
+| Momentum | Recent outperformers | MTUM |
 
 ### 1.2 Input Data
 
-#### 1.2.1 Sequence Structure
+#### 1.2.1 Point-in-Time FRED-MD Data
 
-The model input is a sequence of 50 to 100 macroeconomic tokens, updated as soon as new data becomes available. The new data is placed at the head of the sequence, with the oldest tokens being dropped to maintain a fixed length.
+The model uses **Point-in-Time FRED-MD** macroeconomic data exclusively to avoid look-ahead bias. FRED-MD provides monthly vintages of 112+ macroeconomic indicators.
 
-Each token in the sequence contains the following information:
+**Data Pipeline**:
+- **Source**: FRED-MD vintage files (305 files from 1999-08 to 2024-12)
+- **Loader**: `PointInTimeFREDMDLoader` with publication lag handling
+- **Transformations**: FRED-MD standard transformations (log, diff, etc.)
 
-| Attribute | Description | Type |
-|-----------|-------------|------|
-| Data name | Unique indicator identifier (e.g., PMI_Manufacturing, CPI_Core) | Categorical |
-| Publication type | Consensus, consensus revision, estimate, estimate revision | Categorical |
-| Importance | Importance score of the indicator (1-3) | Numerical |
-| Normalized value | Value normalized by the indicator's historical distribution | Numerical |
-| 5-period moving average | Average of the last 5 publications (for revisions) | Numerical |
-| Standardized surprise | Deviation from expectation divided by the historical standard deviation of surprises | Numerical |
-| Country/Region | Country or economic zone concerned | Categorical |
-| Periodicity | Publication frequency (can be included in the name if relevant) | Categorical |
-| Temporal information | Time offset relative to the present moment (in days) | Numerical |
+**Key Indicators Categories**:
 
-The standardized surprise is calculated according to the data type: for a consensus, it is the difference from the last estimate revision; for an estimate, it is the difference from the last consensus revision; for an estimate revision, it is the difference from the estimate. Only the most recent revision of each type is kept in the sequence at any given time.
+| Category | Examples | Count |
+|----------|----------|-------|
+| Output & Income | Industrial Production, Real GDP | ~15 |
+| Labor Market | Unemployment, Payrolls, Hours | ~30 |
+| Consumption | Retail Sales, Consumer Sentiment | ~10 |
+| Housing | Housing Starts, Building Permits | ~10 |
+| Money & Credit | M1, M2, Consumer Credit | ~15 |
+| Interest Rates | Fed Funds, Treasury Yields | ~20 |
+| Prices | CPI, PPI, PCE | ~20 |
+| Stock Market | S&P 500, Dividend Yield | ~5 |
 
 #### 1.2.2 Market Context Data
 
-In addition to macro data, market condition indicators are integrated as supplementary tokens in the sequence:
+Market condition indicators are integrated as additional features:
 
 | Indicator | Role | Calculation |
 |-----------|------|-------------|
-| Credit spread | Proxy for credit stress and risk aversion | HY - IG or HY - Treasury |
-| Yield curve slope | Proxy for growth expectations | 10Y rate - 2Y rate |
-| VIX | Proxy for implied volatility and market fear | CBOE VIX index level |
+| Term Spread | Yield curve slope | 10Y - 3M Treasury |
+| Default Spread | Credit risk proxy | BAA - AAA spread |
+| VIX (when available) | Implied volatility | CBOE VIX level |
 
-These indicators allow the model to contextualize the interpretation of macro data according to the current market regime (risk-on vs risk-off).
+#### 1.2.3 Sequence Structure
 
-#### 1.2.3 Data Quality Requirements
+The model input is a sequence of 12 monthly observations (1 year lookback), where each timestep contains all available macro indicators for that month.
 
-All data must come from point-in-time databases to avoid any look-ahead bias. Vintages must be meticulously reconstructed to reflect exactly the information available at each decision date. The type structure (consensus, revision, estimate) inherently allows for distinguishing different informational states.
+| Attribute | Dimension | Description |
+|-----------|-----------|-------------|
+| Macro features | 112 | FRED-MD indicators (transformed) |
+| Market context | 3-5 | Spreads, volatility measures |
+| Momentum features | 4 windows | 1M, 3M, 6M, 12M momentum |
+| Total per timestep | ~120 | All features concatenated |
 
 ### 1.3 Input Encoding
 
-The encoding uses an additive embeddings approach for each macroeconomic token:
+The encoding uses an **additive embeddings approach** (BERT-like) for macro tokens:
 
 ```
-E_total = E_identity + E_type + E_importance + E_temporal + E_category + E_country
+E_total = E_indicator + E_temporal + E_category
 ```
 
-| Embedding | Suggested Dimension | Description |
-|-----------|---------------------|-------------|
-| E_identity | 32-64 | Learned embedding specific to each indicator. The model learns to position similar indicators close together in latent space |
-| E_type | 8-16 | Embedding of the publication type (consensus, flash, revised, final) |
-| E_importance | 8 | Projection of the importance score via a linear layer |
-| E_temporal | 16-32 | Continuous sinusoidal positional encoding based on the number of days since today |
-| E_category | 16 | Thematic category embedding (economic activity, employment, inflation, consumption, monetary policy) |
-| E_country | 8-16 | Country or economic zone embedding |
+| Embedding | Current Dimension | Description |
+|-----------|-------------------|-------------|
+| E_indicator | 32 | Learned embedding per indicator |
+| E_temporal | 32 | Sinusoidal positional encoding |
+| E_category | 32 | Macro category embedding |
 
-Continuous numerical values (normalized value, standardized surprise, moving average) are concatenated with the embeddings and then passed through a linear layer followed by normalization:
+Numerical values are projected and added:
 
 ```
-X_token = LayerNorm(Linear(concat(E_total, [val_norm, surprise, MA5])))
+X_token = LayerNorm(E_total + Linear(numerical_values))
 ```
 
 ### 1.4 Model Architecture
 
-#### 1.4.1 Base Configuration
+#### 1.4.1 MICRO Transformer Configuration
 
-The model uses a simplified Transformer architecture with the following hyperparameters:
+The model uses a deliberately minimal Transformer to prevent overfitting with limited data:
 
-| Parameter | Recommended Value |
-|-----------|-------------------|
-| Number of layers | 2-4 |
-| Embedding dimension | 64-128 |
-| Number of attention heads | 2-4 |
-| Dropout | 0.3-0.5 |
+| Parameter | Current Value | Rationale |
+|-----------|---------------|-----------|
+| d_model | 32 | Minimal embedding dimension |
+| num_layers | 1 | Single attention layer |
+| num_heads | 1 | Single attention head |
+| d_ff | 64 | Feedforward dimension |
+| dropout | 0.6 | High dropout for regularization |
+| sequence_length | 12 | 12 months lookback |
+| **Total parameters** | **~12,000** | Intentionally small |
 
-Complexity is deliberately limited given the relative scarcity of training data.
-
-#### 1.4.2 Attention Mechanisms
-
-The model uses relative positional embeddings rather than absolute ones, since the absolute position in the sequence matters less than the temporal relationships between tokens. The attention mechanism must capture several types of relationships:
-
-| Relationship Type | Description |
-|-------------------|-------------|
-| Intra-indicator temporal | Relationship between different publications of the same indicator |
-| Inter-indicator contemporaneous | Relationship between different indicators at the same period |
-| Causal | Masking preventing access to future data |
-
-A standard causal mask is applied to ensure the model cannot use future information. Soft masks based on temporal distance can be added so that attention naturally decreases with temporal distance.
-
-#### 1.4.3 Incorporating Prior Economic Knowledge
-
-Several mechanisms allow injecting economic knowledge into the model:
-
-| Method | Implementation |
-|--------|----------------|
-| Embedding structure | Embeddings by macro category impose proximity between thematically related indicators |
-| Skip connections | Allow the model to easily learn a linear relationship (econometric baseline) |
-| Embedding pre-training | Auxiliary task of classifying indicators by category |
-| Baseline regularization | Loss term penalizing deviations from a simple econometric model (ridge regression) |
-
-### 1.5 Model Output and Loss Function
-
-#### 1.5.1 Output: Allocation Weights with Gated Execution
-
-The model outputs allocation weights that sum to one across the target factor categories. However, to address the problem of excessive turnover and transaction costs, a separate decision layer determines whether to actually execute the new allocation or maintain the current one. This gating mechanism compares the difference between the newly predicted weights and the current portfolio weights against a threshold. If the predicted change is below this threshold, the current allocation is retained; if it exceeds the threshold, the new allocation is implemented.
-
-This two-stage architecture (prediction followed by gated execution) decouples the prediction task from the execution decision, allowing the model to be trained on pure prediction quality while the execution threshold can be calibrated separately based on actual transaction costs. The threshold can be implemented as a hard cutoff or as a soft-thresholding function (non-differentiable or differentiable depending on training needs).
-
-#### 1.5.2 Loss Function: Progressive Approach
-
-The training strategy follows a progression in complexity:
-
-| Phase | Loss Function | Target |
-|-------|---------------|--------|
-| Phase 1 (concept validation) | Cross-Entropy | Binary classification: do cyclicals outperform defensives? |
-| Phase 2 (refinement) | MSE | Relative outperformance score (regression) |
-| Phase 3 (production) | -Sharpe approximation + λ × turnover | Allocation maximizing Sharpe with change penalty |
-
-Phase 1 uses the following formulation:
+#### 1.4.2 Architecture Components
 
 ```
-Loss = CrossEntropy(predicted, y)
-where y = 1 if R_cyclicals > R_defensives, 0 otherwise
+Input (batch, seq_len=12, num_indicators=112)
+    ↓
+MacroTokenEmbedding (additive embeddings)
+    ↓
+TransformerEncoder (1 layer, 1 head)
+    ↓
+Mean Pooling (across sequence)
+    ↓
+Output Head:
+  - Binary mode: 2 logits (cyclical vs defensive)
+  - Multi-factor mode: 6 allocation weights (softmax)
 ```
 
-Phase 3 will use a differentiable approximation of the Sharpe ratio with a turnover penalty:
+### 1.5 Training Strategy
 
-```
-Loss = -E[R] + γ × Var[R] + λ × ||w_t - w_{t-1}||₁
-```
+#### 1.5.1 Two Training Approaches
 
-The coefficient λ must be calibrated based on actual transaction costs.
+**End-to-End (E2E) 3-Phase Training**:
+
+| Phase | Loss Function | Target | Epochs |
+|-------|---------------|--------|--------|
+| Phase 1 | Cross-Entropy | Binary: cyclical > defensive? | 20 |
+| Phase 2 | MSE | Regression on outperformance score | 15 |
+| Phase 3 | -Sharpe approximation | Maximize risk-adjusted returns | 15 |
+
+**Supervised Training**:
+- Compute optimal weights w* using rolling Sharpe maximization
+- Train model to predict w* directly using MSE loss
+
+#### 1.5.2 Multi-Horizon Support
+
+All models **rebalance monthly** (data is monthly). The difference is **what each model optimizes for** during training:
+
+| Horizon | Rebalancing | Phase 3 Optimization Target |
+|---------|-------------|---------------------------|
+| 1M | Monthly | 1-month forward return |
+| 3M | Monthly | 3-month cumulative forward return |
+| 6M | Monthly | 6-month cumulative forward return |
+| 12M | Monthly | 12-month cumulative forward return |
+
+**Cumulative return formula**: `(1+r1) × (1+r2) × ... × (1+rN) - 1`
+
+#### 1.5.3 Allocation Modes
+
+**Binary (2F) Mode**:
+- Output: 2 weights (cyclical, defensive)
+- Target: Binary classification (1 if cyclical > defensive)
+- Metric: Accuracy reported
+
+**Multi-factor (6F) Mode**:
+- Output: 6 weights (cyclical, defensive, value, growth, quality, momentum)
+- Target: Softmax allocation weights
+- No accuracy (regression task)
 
 ### 1.6 Validation and Backtesting
 
-#### 1.6.1 Protocol: Walk-Forward Validation Only
+#### 1.6.1 Walk-Forward Validation Protocol
 
-Classical cross-validation is strictly excluded because it violates the temporal order of the data. The protocol uses walk-forward validation with an expanding window:
+Classical cross-validation is **strictly excluded**. The protocol uses walk-forward validation with expanding windows:
 
 | Window | Train | Validation | Test |
 |--------|-------|------------|------|
-| 1 | 2000-2014 | 2015-2017 | 2018-2024 |
-| 2 | 2000-2015 | 2016-2018 | 2019-2024 |
-| 3 | 2000-2016 | 2017-2019 | 2020-2024 |
+| 1 | 2000-2013 | 2014-2016 | 2017-2024 |
+| 2 | 2000-2014 | 2015-2017 | 2018-2024 |
+| 3 | 2000-2015 | 2016-2018 | 2019-2024 |
 
-Performance is averaged across multiple windows. A final holdout is reserved and will be consulted only once to avoid data snooping.
+**Horizon-aware windows**: For longer horizons, a lookahead buffer is added to prevent data leakage.
 
-#### 1.6.2 Tested Time Horizons
+#### 1.6.2 Evaluation Metrics
 
-| Horizon | Signal Characteristic |
-|---------|----------------------|
-| 1 week | Sensitive to macro surprises |
-| 1 month | Momentum and expectation revision |
-| 3 months | Intermediate trends |
-| 6 months | Economic cycle |
-| 1 year | Absolute level and complete cycle |
+| Metric | Description | Target |
+|--------|-------------|--------|
+| Sharpe Ratio | Risk-adjusted return | > 0.5 |
+| Information Coefficient (IC) | Prediction-return correlation | > 0.05 |
+| Max Drawdown | Largest peak-to-trough decline | > -0.25 |
+| Accuracy (Binary only) | Classification accuracy | > 55% |
 
-### 1.7 Progressive Development Approach
+#### 1.6.3 Composite Ranking Score
 
-Given the difficulty of the problem and the potentially low signal-to-noise ratio, the development strategy follows a step-by-step progression with validation at each level:
+For multi-criteria model selection:
 
-| Step | Model | Objective |
-|------|-------|-----------|
-| 1 | Naive baseline (style momentum) | Establish a benchmark to beat |
-| 2 | Logistic Regression / Ridge | Validate the existence of a predictive signal |
-| 3 | Gradient Boosting (XGBoost, LightGBM) | Capture non-linear interactions |
-| 4 | Simple LSTM/GRU (1-2 layers, 32-64 units) | Test the value of sequential modeling |
-| 5 | Minimal Transformer | Exploit attention if previous steps show signal |
+```
+Score = 0.4 × Sharpe_norm + 0.3 × IC_norm + 0.3 × MaxDD_norm
+```
 
-Progression to the next step is justified only if the current step shows significant improvement over the baseline.
-
-The initial test case focuses on a simplified configuration: predicting the relative outperformance of "cyclicals vs defensives" at 1 month.
+Each metric normalized to [0, 1]. Higher score = better model.
 
 ---
 
-## 2. Problems Identified with Solutions
+## 2. Current Implementation
 
-### 2.1 Transaction Costs and Churning
+### 2.1 Comparison Framework
 
-**Problem**: The model may recommend frequent allocation changes whose transaction costs exceed potential gains. This tendency is amplified by direct performance optimization without consideration of market frictions.
+**16 Combinations Tested**:
 
-**Solution adopted**: The model outputs allocation weights (summing to one), but a separate gating layer determines whether to actually execute the new allocation. This layer compares the magnitude of the proposed change against a threshold calibrated to transaction costs. If the change is below the threshold, the current allocation is maintained; if above, the new weights are implemented. This architecture decouples prediction quality from execution decisions and allows the action threshold to be adjusted independently of model training.
+| Strategy | Allocation | Horizons |
+|----------|------------|----------|
+| E2E (3-phase) | Binary (2F) | 1M, 3M, 6M, 12M |
+| E2E (3-phase) | Multi-factor (6F) | 1M, 3M, 6M, 12M |
+| Supervised | Binary (2F) | 1M, 3M, 6M, 12M |
+| Supervised | Multi-factor (6F) | 1M, 3M, 6M, 12M |
 
-### 2.2 Market Context Integration
+### 2.2 Sample Counts by Horizon
 
-**Problem**: The market context (risk-on vs risk-off) influences how styles react to macro data. The same signal can have different implications depending on the market regime.
+| Horizon | Samples | Loss vs 1M |
+|---------|---------|------------|
+| 1M | 287 | - |
+| 3M | 285 | -1% |
+| 6M | 282 | -2% |
+| 12M | 276 | -4% |
 
-**Solution adopted**: Integrate market condition indicators as supplementary features in the input sequence:
+### 2.3 Key Files
 
-| Indicator | Role |
-|-----------|------|
-| Credit spread (HY - IG or HY - Treasury) | Proxy for credit stress and risk aversion |
-| Yield curve slope (10Y - 2Y) | Proxy for economic growth expectations |
-| VIX | Proxy for implied volatility and market fear |
-
-These indicators are treated as special "market" tokens in the sequence, allowing the attention mechanism to weight macro data differently according to context.
-
-### 2.3 Look-Ahead Bias in Data
-
-**Problem**: Using revised data or "final" consensus values that were not available at the time of the investment decision leads to artificially inflated backtest performance that is not reproducible in production.
-
-**Solution adopted**: Point-in-time databases are used exclusively, with sources providing historical vintages (Bloomberg, Refinitiv, ALFRED from the Fed). Vintages are meticulously reconstructed to document precisely the information available at each decision date. The type structure (consensus/revision/estimate) in the input data inherently reflects the informational state.
-
-### 2.4 Efficient Sequence Encoding
-
-**Problem**: How to efficiently represent the multiple dimensions of information for each macro token (identity, type, temporality, category, numerical values) without dimensionality explosion?
-
-**Solution adopted**: Additive embeddings architecture where different categorical embeddings are summed (not concatenated), then combined with numerical features via a linear projection. This approach is proven (similar to BERT) and avoids the unnecessary complexity of embeddings of embeddings.
-
-### 2.5 Appropriate Architecture for Limited Data
-
-**Problem**: Transformers are designed for massive corpora, while historical macro data is inherently limited (a few thousand temporal points at most).
-
-**Solution adopted**: Minimalist Transformer configuration (2-4 layers, 64-128 dimensions, 2-4 heads, high dropout 0.3-0.5) with fewer than 10k parameters to start. Gradual increase in complexity only if the data justifies it.
-
-### 2.6 Loss Function and Prediction Target
-
-**Problem**: Directly predicting the Sharpe ratio or optimal weights is difficult because these targets are unstable and the solution space is vast.
-
-**Solution adopted**: Progressive approach starting with simple binary classification (which category outperforms?) with Cross-Entropy, then evolving toward score regression, and finally toward differentiable Sharpe optimization once the concept is validated.
-
-### 2.7 Injecting Economic Knowledge
-
-**Problem**: How to benefit the model from established knowledge in financial economics rather than learning everything from scratch with limited data?
-
-**Solution adopted**: Combination of several mechanisms including embeddings structured by category so that thematically related indicators are represented as close together, skip connections so the model can easily learn simple linear relationships, regularization toward baseline with a penalty on deviations from a reference econometric model, and pre-training with an auxiliary task of classifying indicators.
-
-### 2.8 Temporal Validation Protocol
-
-**Problem**: Standard cross-validation mixes past and future, creating unrealistic backtest performance.
-
-**Solution adopted**: Exclusive walk-forward validation with expanding window, repeated over several periods. A final holdout is reserved for ultimate evaluation to avoid data snooping.
-
-### 2.9 Problem Complexity and Over-Engineering Risk
-
-**Problem**: The risk of developing a complex model when the underlying signal is weak or non-existent.
-
-**Solution adopted**: Progressive development approach with validation at each step. Starting with simple models (regression, gradient boosting) to confirm the existence of a signal before investing in the Transformer architecture.
+| File | Purpose |
+|------|---------|
+| `src/main_strategy.py` | Core `FactorAllocationStrategy` class |
+| `src/comparison_runner.py` | 16-combination comparison runner |
+| `src/multi_horizon_strategy.py` | Multi-horizon orchestrator |
+| `src/data/point_in_time_loader.py` | Point-in-Time FRED-MD loader |
+| `src/data/factor_data_loader.py` | Factor returns loader |
+| `src/models/transformer.py` | `FactorAllocationTransformer` model |
+| `src/models/embeddings.py` | `MacroTokenEmbedding` (additive) |
+| `src/models/training_strategies.py` | E2E and Supervised trainers |
+| `src/utils/walk_forward.py` | Walk-forward validation |
+| `notebooks/factor_allocation_demo.ipynb` | Main comparison notebook |
 
 ---
 
-## 3. Unsolved Problems
+## 3. Results and Findings
 
-### 3.1 Fundamental Scarcity of Macroeconomic Data
+### 3.1 Current Performance (16 Combinations)
 
-**Problem description**: Transformers are designed to be trained on corpora of millions or even billions of tokens. Even with 30 years of macro data history (which is optimistic for some indicators), we have approximately 360 monthly points or 1,560 weeks. A sequence of 50-100 macro tokens multiplied by a few thousand temporal points remains extremely limited for a deep learning model.
+Best results from the comparison (example run):
 
-**Implications**: The model will have seen very few examples of each "type" of economic situation. Economic regimes can be counted on one hand in the available history: 5-6 complete economic cycles, 2-3 major crises (2008, 2020, 2022). The ability to generalize to new regimes is therefore structurally limited.
+| Strategy | Allocation | Horizon | Sharpe | IC | Max DD |
+|----------|------------|---------|--------|-----|--------|
+| Sup | Multi | 6M | +0.99 | +0.14 | -0.04 |
+| Sup | Multi | 3M | +1.01 | -0.19 | -0.05 |
+| E2E | Multi | 1M | +0.93 | +0.02 | -0.11 |
+| E2E | Binary | 3M | +0.78 | +0.26 | -0.35 |
 
-**Why this problem has no simple solution**: Unlike computer vision, we cannot artificially generate realistic macro data through data augmentation. Synthetic data risks injecting biases or non-existent patterns. Using data from other countries poses transferability problems since the relationship between macro indicators and style performance can differ significantly across geographic zones.
+### 3.2 Key Findings
 
-**Partial mitigation**: The progressive approach (starting simple) allows detecting whether a signal exists before investing in a complex model. Aggressive regularization limits overfitting. But the fundamental constraint of data quantity remains unavoidable.
+1. **Multi-factor (6F) outperforms Binary (2F)**:
+   - Average Sharpe: +0.90 vs +0.70
+   - Lower drawdowns with diversified allocation
 
-### 3.2 Non-Stationarity of Macro-Style Relationships
+2. **Supervised training slightly better than E2E**:
+   - Average Sharpe: +0.82 vs +0.77
+   - More stable training dynamics
 
-**Problem description**: The relationship between macroeconomic indicators and relative style performance evolves structurally over time. For example, the sensitivity of the "Value" style to interest rates has changed significantly since the 2008 crisis with the era of zero rates. Today's "Growth" companies (mostly tech) do not have the same profile as those of the 1990s.
+3. **3M horizon shows best average Sharpe**:
+   - Intermediate horizons capture momentum effects
+   - 1M may be too noisy, 12M loses signal
 
-**Implications**: A model trained on historical data learns patterns that may no longer be valid. A Transformer can theoretically capture these evolutions via temporal attention, but with so little data, it cannot reliably learn regime changes. The risk is learning obsolete relationships.
-
-**Why this problem has no simple solution**: We cannot know a priori which relationships have changed and which remain stable. Weighting recent data more heavily further reduces the effective size of the training sample. Regime change detection methods themselves require a lot of data.
-
-### 3.3 Time Horizon and Causality Problem
-
-**Problem description**: The strategy proposes testing several horizons (1 week to 1 year), but the causal relationship between macro and styles works differently depending on the horizon:
-
-| Horizon | Signal Nature |
-|---------|---------------|
-| Short term (1 week) | Surprise matters (deviation vs consensus) |
-| Medium term (1-3 months) | Momentum and expectation revision matter |
-| Long term (6-12 months) | Absolute level and positioning in the economic cycle matter |
-
-**Implications**: The same model with the same inputs will have difficulty capturing these very different dynamics. The signal we seek to extract is not of the same nature depending on the horizon. Training a single multi-horizon model risks producing mediocre results across all horizons.
-
-**Why this problem has no simple solution**: Developing separate models per horizon further divides the available data. The relevant features differ by horizon, but we do not know a priori which ones. The optimal architecture may also vary.
-
-### 3.4 Informational Efficiency of Markets
-
-**Problem description**: Macroeconomic data is public and scrutinized by thousands of analysts and trading algorithms. Information is integrated into prices within seconds for surprises, within days for second-order implications. The proposed strategy does not aim for an execution speed advantage.
-
-**Implications**: For an ML model to extract systematic alpha from public data, it must develop superior interpretation capability compared to market participants. This is an ambitious and not guaranteed objective, especially with a model trained only on historical data.
-
-**Why this problem has no simple solution**: The potential advantage of the model would be to capture complex non-linear interactions or sequence effects that human analysts neglect. But these effects, if they exist, are probably subtle and difficult to distinguish from statistical noise with the available data.
-
-### 3.5 Overfitting Risk
-
-**Problem description**: With many input features (multiple indicators × attributes per token) and relatively few independent observations (a few thousand temporal points at most), the model risks memorizing idiosyncratic noise from historical data rather than learning generalizable relationships.
-
-**Available mitigations**: Aggressive regularization (high dropout 0.3-0.5, weight decay, strict early stopping), complexity reduction (very small model with 1-2 layers, 32-64 dimensions), walk-forward validation for detecting temporal overfitting, and parsimonious feature selection (limiting to 10-15 truly informative indicators).
-
-**Why this problem remains concerning**: Even with these mitigations, the overfitting risk remains high given the fundamental imbalance between the potential richness of the representation and the poverty of the data. Regularization techniques reduce the problem but do not eliminate it. The model can overfit in subtle ways (for example, by learning patterns specific to certain historical regimes that are not reproducible).
+4. **Best composite score**: Sup + Multi @ 6M
+   - Balances Sharpe, IC, and drawdown
 
 ---
 
-## 4. Recommendations and Next Steps
+## 4. Problems Identified with Solutions
 
-### 4.1 Development Priorities
+### 4.1 Transaction Costs and Churning
 
-The first priority is to validate the existence of a signal using simple methods (logistic regression, random forest) on the simplified test case (cyclicals vs defensives, 1-month horizon). The second priority is to build the point-in-time database with meticulous vintage reconstruction for priority macro indicators. The third priority is to define success metrics: target Information Coefficient, minimum improvement over momentum baseline to justify moving to the next step. The fourth priority is to develop the walk-forward backtesting infrastructure before starting experimentation.
+**Problem**: Frequent allocation changes erode returns through transaction costs.
 
-### 4.2 Stop Criteria
+**Solution Implemented**: Execution threshold in backtest. Only execute allocation changes above a configurable threshold (default: 5% change).
+
+### 4.2 Look-Ahead Bias
+
+**Problem**: Using revised data not available at decision time.
+
+**Solution Implemented**: Point-in-Time FRED-MD loader with 305 vintage files. Each decision uses only data that was actually available at that date, with configurable publication lag.
+
+### 4.3 Overfitting with Limited Data
+
+**Problem**: ~287 monthly observations is extremely limited for deep learning.
+
+**Solution Implemented**:
+- MICRO architecture (12k params, 1 layer, 1 head)
+- High dropout (0.6)
+- Walk-forward validation to detect temporal overfitting
+- Progressive training (start simple, add complexity)
+
+### 4.4 Sequence Encoding Efficiency
+
+**Problem**: How to represent multi-dimensional macro tokens efficiently?
+
+**Solution Implemented**: Additive embeddings (BERT-like) where categorical embeddings are summed, not concatenated. Reduces parameter count significantly.
+
+---
+
+## 5. Unsolved Problems and Limitations
+
+### 5.1 Fundamental Data Scarcity
+
+~287 monthly observations (24 years) is inherently limited. The model has seen only 2-3 major crises and 5-6 economic cycles. Generalization to new regimes remains uncertain.
+
+### 5.2 Non-Stationarity
+
+The relationship between macro indicators and factor performance evolves. Post-2008 zero-rate era changed many dynamics. The model may learn obsolete patterns.
+
+### 5.3 Market Efficiency
+
+Macroeconomic data is public and widely analyzed. Any predictable signal may already be priced in. The model must find non-obvious interactions to add value.
+
+### 5.4 Single Region
+
+Current implementation focuses on US data only. Regional models for Europe, Japan, etc. are designed but not yet implemented.
+
+---
+
+## 6. Recommendations and Next Steps
+
+### 6.1 Immediate Priorities
+
+1. **Walk-forward OOS evaluation**: Run proper out-of-sample validation across multiple windows
+2. **Transaction cost sensitivity**: Test with realistic transaction costs (10-50 bps)
+3. **Regime analysis**: Analyze performance across different market regimes
+
+### 6.2 Future Development
+
+1. **Regional expansion**: Implement Europe and Japan models
+2. **Feature selection**: Identify most predictive indicators
+3. **Ensemble methods**: Combine multiple horizon models
+4. **Alternative architectures**: Test LSTM, attention-only variants
+
+### 6.3 Stop Criteria
 
 | Condition | Decision |
 |-----------|----------|
-| IC close to zero with simple regression | Reassess the fundamental strategy |
-| No significant improvement over momentum baseline | Do not proceed to Transformer |
-| Systematic overfitting despite regularization | Drastically simplify the model or reduce features |
-
-### 4.3 Points of Vigilance
-
-The real added value will probably come less from the model architecture than from the quality of the data (rigorous point-in-time, economically sensible feature engineering) and the rigor of backtesting (strict walk-forward, realistic transaction costs, uncontaminated final holdout).
+| OOS Sharpe < 0.3 consistently | Reassess strategy fundamentals |
+| IC near zero across all horizons | Signal may not exist |
+| Large train-test gap (>0.5 Sharpe) | Overfitting despite regularization |
 
 ---
 
-*Document generated on: [date]*
-*Version: 1.0*
+*Document updated: 2026-01-31*
+*Version: 2.0*
+*Status: Research/Development*

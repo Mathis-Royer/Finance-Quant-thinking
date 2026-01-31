@@ -270,6 +270,7 @@ class PerformanceMetrics:
         targets: np.ndarray,
         portfolio_returns: Optional[np.ndarray] = None,
         benchmark_returns: Optional[np.ndarray] = None,
+        periods_per_year: int = 12,
     ) -> PerformanceReport:
         """
         Generate complete performance report.
@@ -278,6 +279,7 @@ class PerformanceMetrics:
         :param targets (np.ndarray): Actual outcomes
         :param portfolio_returns (Optional[np.ndarray]): Strategy returns
         :param benchmark_returns (Optional[np.ndarray]): Benchmark returns
+        :param periods_per_year (int): Number of periods per year (12=monthly, 52=weekly)
 
         :return report (PerformanceReport): Complete performance report
         """
@@ -288,10 +290,10 @@ class PerformanceMetrics:
 
         # Portfolio metrics (if available)
         if portfolio_returns is not None:
-            sharpe = cls.sharpe_ratio(portfolio_returns)
+            sharpe = cls.sharpe_ratio(portfolio_returns, periods_per_year=periods_per_year)
             total_ret = (1 + portfolio_returns).prod() - 1
-            ann_ret = cls.annualized_return(total_ret, len(portfolio_returns))
-            vol = cls.annualized_volatility(portfolio_returns)
+            ann_ret = cls.annualized_return(total_ret, len(portfolio_returns), periods_per_year)
+            vol = cls.annualized_volatility(portfolio_returns, periods_per_year)
             max_dd = cls.maximum_drawdown(np.cumprod(1 + portfolio_returns))
             win = cls.win_rate(portfolio_returns)
         else:

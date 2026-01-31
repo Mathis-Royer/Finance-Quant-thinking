@@ -11,11 +11,12 @@ import numpy as np
 import pandas as pd
 from dataclasses import dataclass
 
-from ..data.data_loader import (
+from data.data_loader import (
     MacroDataLoader,
     MacroToken,
     MacroCategory,
     PublicationType,
+    Periodicity,
     Region,
 )
 
@@ -29,17 +30,20 @@ class FeatureConfig:
     :param include_momentum (bool): Include recent factor momentum
     :param include_market_context (bool): Include VIX, spreads, etc.
     :param normalize_features (bool): Standardize features
-    :param aggregation_windows (List[int]): Windows for aggregation (weeks)
+    :param aggregation_windows (List[int]): Windows for aggregation (weeks/months)
+    :param use_fred_md (bool): Use FRED-MD indicator definitions
     """
     sequence_length: int = 50
     include_momentum: bool = True
     include_market_context: bool = True
     normalize_features: bool = True
     aggregation_windows: List[int] = None
+    use_fred_md: bool = False
 
     def __post_init__(self):
         if self.aggregation_windows is None:
-            self.aggregation_windows = [1, 4, 12]
+            # Use months for FRED-MD (monthly data), weeks for other sources
+            self.aggregation_windows = [1, 3, 12] if self.use_fred_md else [1, 4, 12]
 
 
 class FeatureEngineer:
@@ -59,16 +63,23 @@ class FeatureEngineer:
         self,
         config: Optional[FeatureConfig] = None,
         region: Region = Region.US,
+        fred_md_indicators: Optional[List] = None,
     ):
         """
         Initialize feature engineer.
 
         :param config (FeatureConfig): Feature configuration
         :param region (Region): Target region
+        :param fred_md_indicators (List): Custom FRED-MD indicators from loader
         """
         self.config = config or FeatureConfig()
         self.region = region
-        self.loader = MacroDataLoader(region, self.config.sequence_length)
+        self.loader = MacroDataLoader(
+            region,
+            self.config.sequence_length,
+            use_fred_md=self.config.use_fred_md,
+            fred_md_indicators=fred_md_indicators,
+        )
 
         # Feature statistics for normalization
         self.feature_means: Optional[np.ndarray] = None
@@ -79,6 +90,7 @@ class FeatureEngineer:
         self.category_to_idx: Dict[str, int] = {}
         self.pub_type_to_idx: Dict[str, int] = {}
         self.region_to_idx: Dict[str, int] = {}
+        self.periodicity_to_idx: Dict[str, int] = {}
 
         self._build_mappings()
 
@@ -99,6 +111,10 @@ class FeatureEngineer:
         # Regions
         for idx, reg in enumerate(Region):
             self.region_to_idx[reg.value] = idx
+
+        # Periodicities
+        for idx, period in enumerate(Periodicity):
+            self.periodicity_to_idx[period.value] = idx
 
     def create_flat_features(
         self,
@@ -268,6 +284,7 @@ class FeatureEngineer:
         pub_type_ids = np.zeros(self.config.sequence_length, dtype=np.int64)
         category_ids = np.zeros(self.config.sequence_length, dtype=np.int64)
         country_ids = np.zeros(self.config.sequence_length, dtype=np.int64)
+        periodicity_ids = np.zeros(self.config.sequence_length, dtype=np.int64)
         importance = np.zeros(self.config.sequence_length, dtype=np.float32)
         days_offset = np.zeros(self.config.sequence_length, dtype=np.float32)
         normalized_value = np.zeros(self.config.sequence_length, dtype=np.float32)
@@ -282,6 +299,7 @@ class FeatureEngineer:
             pub_type_ids[i] = self.pub_type_to_idx.get(row.get("publication_type", ""), 0)
             category_ids[i] = self.category_to_idx.get(row.get("category", ""), 0)
             country_ids[i] = self.region_to_idx.get(row.get("region", ""), 0)
+            periodicity_ids[i] = self.periodicity_to_idx.get(row.get("periodicity", "monthly"), 0)
             importance[i] = row.get("importance", 2)
             days_offset[i] = (row.get("timestamp", as_of_date) - as_of_date).days
             normalized_value[i] = row.get("normalized_value", 0.0)
@@ -293,6 +311,7 @@ class FeatureEngineer:
             "pub_type_ids": pub_type_ids,
             "category_ids": category_ids,
             "country_ids": country_ids,
+            "periodicity_ids": periodicity_ids,
             "importance": importance,
             "days_offset": days_offset,
             "normalized_value": normalized_value,
@@ -436,3 +455,11 @@ class FeatureEngineer:
         :return count (int): Number of categories
         """
         return len(MacroCategory)
+
+    def get_num_periodicities(self) -> int:
+        """
+        Get number of periodicity types.
+
+        :return count (int): Number of periodicities
+        """
+        return len(Periodicity)

@@ -66,28 +66,20 @@ class MacroTokenEmbedding(nn.Module):
     """
     Embedding layer for macroeconomic tokens.
 
-    Implements additive embeddings:
-    - E_identity: Learned embedding for each unique indicator
-    - E_type: Embedding for publication type (consensus, revision, etc.)
-    - E_importance: Linear projection of importance score
-    - E_temporal: Sinusoidal encoding of days offset
-    - E_category: Embedding for macro category
-    - E_country: Embedding for country/region
+    Implements ADDITIVE embeddings as specified in strategy document (Section 1.3):
+        E_total = E_identity + E_type + E_importance + E_temporal + E_category + E_country + E_periodicity
+        X_token = LayerNorm(Linear(concat(E_total, [val_norm, surprise, MA5])))
 
-    Numerical features (normalized_value, surprise, MA5) are concatenated
-    with the embedding sum and projected through a linear layer.
+    All categorical embeddings share the same dimension (d_embed) so they can be SUMMED.
+    This is the BERT-like approach that allows learning shared semantic space.
 
     :param num_indicators (int): Number of unique indicators
     :param num_pub_types (int): Number of publication types
     :param num_categories (int): Number of macro categories
     :param num_regions (int): Number of regions
+    :param num_periodicities (int): Number of periodicity types (daily, weekly, monthly, quarterly, irregular)
     :param d_model (int): Output embedding dimension
-    :param d_identity (int): Identity embedding dimension
-    :param d_type (int): Publication type embedding dimension
-    :param d_importance (int): Importance projection dimension
-    :param d_temporal (int): Temporal encoding dimension
-    :param d_category (int): Category embedding dimension
-    :param d_country (int): Country embedding dimension
+    :param d_embed (int): Shared embedding dimension for all categorical embeddings
     :param dropout (float): Dropout probability
     """
 
@@ -97,55 +89,47 @@ class MacroTokenEmbedding(nn.Module):
         num_pub_types: int = 6,
         num_categories: int = 8,
         num_regions: int = 6,
-        d_model: int = 64,
-        d_identity: int = 32,
-        d_type: int = 8,
-        d_importance: int = 8,
-        d_temporal: int = 16,
-        d_category: int = 16,
-        d_country: int = 8,
-        dropout: float = 0.3,
+        num_periodicities: int = 5,
+        d_model: int = 32,
+        d_embed: int = 16,
+        dropout: float = 0.5,
     ):
         """
-        Initialize embedding layer.
+        Initialize embedding layer with ADDITIVE embeddings.
 
         :param num_indicators (int): Number of unique indicators
         :param num_pub_types (int): Number of publication types
         :param num_categories (int): Number of macro categories
         :param num_regions (int): Number of regions
+        :param num_periodicities (int): Number of periodicity types
         :param d_model (int): Output embedding dimension
-        :param d_identity (int): Identity embedding dimension
-        :param d_type (int): Publication type embedding dimension
-        :param d_importance (int): Importance projection dimension
-        :param d_temporal (int): Temporal encoding dimension
-        :param d_category (int): Category embedding dimension
-        :param d_country (int): Country embedding dimension
+        :param d_embed (int): Shared embedding dimension (all embeddings use same dim for addition)
         :param dropout (float): Dropout probability
         """
         super().__init__()
 
         self.d_model = d_model
+        self.d_embed = d_embed
 
-        # Categorical embeddings
-        self.identity_embedding = nn.Embedding(num_indicators, d_identity)
-        self.type_embedding = nn.Embedding(num_pub_types, d_type)
-        self.category_embedding = nn.Embedding(num_categories, d_category)
-        self.country_embedding = nn.Embedding(num_regions, d_country)
+        # All categorical embeddings use SAME dimension for ADDITIVE approach
+        self.identity_embedding = nn.Embedding(num_indicators, d_embed)
+        self.type_embedding = nn.Embedding(num_pub_types, d_embed)
+        self.category_embedding = nn.Embedding(num_categories, d_embed)
+        self.country_embedding = nn.Embedding(num_regions, d_embed)
+        self.periodicity_embedding = nn.Embedding(num_periodicities, d_embed)
 
-        # Importance projection (scalar -> d_importance)
-        self.importance_projection = nn.Linear(1, d_importance)
+        # Importance projection (scalar -> d_embed for addition)
+        self.importance_projection = nn.Linear(1, d_embed)
 
-        # Temporal encoding
-        self.temporal_encoding = SinusoidalPositionalEncoding(d_temporal)
-
-        # Total embedding dimension before projection
-        d_embed_total = d_identity + d_type + d_importance + d_temporal + d_category + d_country
+        # Temporal encoding (same dimension for addition)
+        self.temporal_encoding = SinusoidalPositionalEncoding(d_embed)
 
         # Numerical features: normalized_value, surprise, MA5
         num_numerical = 3
 
-        # Final projection to d_model
-        self.projection = nn.Linear(d_embed_total + num_numerical, d_model)
+        # Final projection: concat(E_total, numericals) -> d_model
+        # E_total has dimension d_embed (after summing), plus 3 numerical features
+        self.projection = nn.Linear(d_embed + num_numerical, d_model)
         self.layer_norm = nn.LayerNorm(d_model)
         self.dropout = nn.Dropout(dropout)
 
@@ -155,6 +139,7 @@ class MacroTokenEmbedding(nn.Module):
         pub_type_ids: torch.Tensor,
         category_ids: torch.Tensor,
         country_ids: torch.Tensor,
+        periodicity_ids: torch.Tensor,
         importance: torch.Tensor,
         days_offset: torch.Tensor,
         normalized_value: torch.Tensor,
@@ -162,12 +147,17 @@ class MacroTokenEmbedding(nn.Module):
         ma5: torch.Tensor,
     ) -> torch.Tensor:
         """
-        Compute token embeddings.
+        Compute token embeddings using ADDITIVE approach.
+
+        As per strategy document Section 1.3:
+            E_total = E_identity + E_type + E_importance + E_temporal + E_category + E_country + E_periodicity
+            X_token = LayerNorm(Linear(concat(E_total, [val_norm, surprise, MA5])))
 
         :param indicator_ids (torch.Tensor): Indicator indices [batch, seq]
         :param pub_type_ids (torch.Tensor): Publication type indices [batch, seq]
         :param category_ids (torch.Tensor): Category indices [batch, seq]
         :param country_ids (torch.Tensor): Country indices [batch, seq]
+        :param periodicity_ids (torch.Tensor): Periodicity indices [batch, seq]
         :param importance (torch.Tensor): Importance scores [batch, seq]
         :param days_offset (torch.Tensor): Days offset [batch, seq]
         :param normalized_value (torch.Tensor): Normalized values [batch, seq]
@@ -176,29 +166,28 @@ class MacroTokenEmbedding(nn.Module):
 
         :return embeddings (torch.Tensor): Token embeddings [batch, seq, d_model]
         """
-        # Categorical embeddings
+        # Categorical embeddings (all same dimension d_embed)
         e_identity = self.identity_embedding(indicator_ids)
         e_type = self.type_embedding(pub_type_ids)
         e_category = self.category_embedding(category_ids)
         e_country = self.country_embedding(country_ids)
+        e_periodicity = self.periodicity_embedding(periodicity_ids)
 
-        # Importance projection
+        # Importance projection (to d_embed)
         e_importance = self.importance_projection(importance.unsqueeze(-1))
 
-        # Temporal encoding
+        # Temporal encoding (d_embed)
         e_temporal = self.temporal_encoding(days_offset)
 
-        # Sum categorical embeddings (additive approach)
-        e_total = torch.cat(
-            [e_identity, e_type, e_category, e_country, e_importance, e_temporal],
-            dim=-1,
-        )
+        # ADDITIVE embeddings: SUM all categorical embeddings (not concatenate!)
+        # This follows the BERT-like approach specified in the strategy document
+        e_total = e_identity + e_type + e_category + e_country + e_periodicity + e_importance + e_temporal
 
-        # Concatenate numerical features
+        # Concatenate numerical features with the summed embedding
         numerical = torch.stack([normalized_value, surprise, ma5], dim=-1)
         combined = torch.cat([e_total, numerical], dim=-1)
 
-        # Project and normalize
+        # Project to d_model and normalize
         output = self.projection(combined)
         output = self.layer_norm(output)
         output = self.dropout(output)
@@ -216,7 +205,7 @@ class MarketContextEmbedding(nn.Module):
     :param dropout (float): Dropout probability
     """
 
-    def __init__(self, d_model: int = 64, dropout: float = 0.3):
+    def __init__(self, d_model: int = 32, dropout: float = 0.5):
         """
         Initialize market context embedding.
 
@@ -268,8 +257,8 @@ class TokenEncoder(nn.Module):
     def __init__(
         self,
         num_indicators: int,
-        d_model: int = 64,
-        dropout: float = 0.3,
+        d_model: int = 32,
+        dropout: float = 0.5,
     ):
         """
         Initialize token encoder.
@@ -309,6 +298,7 @@ class TokenEncoder(nn.Module):
             pub_type_ids=macro_batch["pub_type_ids"],
             category_ids=macro_batch["category_ids"],
             country_ids=macro_batch["country_ids"],
+            periodicity_ids=macro_batch["periodicity_ids"],
             importance=macro_batch["importance"],
             days_offset=macro_batch["days_offset"],
             normalized_value=macro_batch["normalized_value"],
