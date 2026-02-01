@@ -477,7 +477,7 @@ def format_results_table(
         if not np.isnan(results[k].get('sharpe_ratio', np.nan)) else -999
     )
     best_sharpe = results[best_key]['sharpe_ratio']
-    lines.append(f"\nBEST: {best_key[0]} + {best_key[1]} @ {best_key[2]}M -> Sharpe={best_sharpe:+.4f}")
+    lines.append(f"\nBEST: {best_key[0]} + {best_key[1]} @ {best_key[2]}M -> Sharpe={best_sharpe:+.2f}")
 
     return "\n".join(lines)
 
@@ -530,6 +530,7 @@ def compute_composite_score(
     ic_col: str = 'ic',
     maxdd_col: str = 'maxdd',
     weights: Dict[str, float] = None,
+    use_fixed_bounds: bool = True,
 ) -> pd.DataFrame:
     """
     Compute composite score for a DataFrame with Sharpe, IC, and MaxDD columns.
@@ -543,6 +544,7 @@ def compute_composite_score(
     :param ic_col (str): Column name for IC
     :param maxdd_col (str): Column name for MaxDD
     :param weights (Dict): Weights for each metric (default: sharpe=0.4, ic=0.3, maxdd=0.3)
+    :param use_fixed_bounds (bool): If True, use fixed normalization bounds for stable scores
 
     :return df (pd.DataFrame): DataFrame with 'score' and 'rank' columns added
     """
@@ -551,18 +553,28 @@ def compute_composite_score(
 
     df = df.copy()
 
+    if use_fixed_bounds:
+        # Fixed bounds for stable scores regardless of filtered subset
+        sharpe_min, sharpe_max = -0.5, 1.0  # Typical Sharpe range
+        ic_min, ic_max = -0.5, 0.5          # IC is a correlation
+        maxdd_min, maxdd_max = -0.20, 0.0   # MaxDD typically -20% to 0%
+    else:
+        # Relative bounds (original behavior)
+        sharpe_min, sharpe_max = df[sharpe_col].min(), df[sharpe_col].max()
+        ic_min, ic_max = df[ic_col].min(), df[ic_col].max()
+        maxdd_min, maxdd_max = df[maxdd_col].min(), df[maxdd_col].max()
+
+    def safe_normalize(series: pd.Series, xmin: float, xmax: float) -> pd.Series:
+        """Normalize series to [0, 1] with bounds clipping."""
+        if xmax - xmin < 1e-8:
+            return pd.Series([0.5] * len(series), index=series.index)
+        clipped = series.clip(lower=xmin, upper=xmax)
+        return (clipped - xmin) / (xmax - xmin)
+
     # Normalize each metric to [0, 1]
-    # Sharpe: higher is better
-    sharpe_min, sharpe_max = df[sharpe_col].min(), df[sharpe_col].max()
-    sharpe_norm = (df[sharpe_col] - sharpe_min) / (sharpe_max - sharpe_min + 1e-8)
-
-    # IC: higher is better
-    ic_min, ic_max = df[ic_col].min(), df[ic_col].max()
-    ic_norm = (df[ic_col] - ic_min) / (ic_max - ic_min + 1e-8)
-
-    # MaxDD: closer to 0 is better (less negative)
-    maxdd_min, maxdd_max = df[maxdd_col].min(), df[maxdd_col].max()
-    maxdd_norm = (df[maxdd_col] - maxdd_min) / (maxdd_max - maxdd_min + 1e-8)
+    sharpe_norm = safe_normalize(df[sharpe_col], sharpe_min, sharpe_max)
+    ic_norm = safe_normalize(df[ic_col], ic_min, ic_max)
+    maxdd_norm = safe_normalize(df[maxdd_col], maxdd_min, maxdd_max)
 
     # Compute composite score
     df['score'] = (
@@ -693,8 +705,8 @@ def format_ranking_table(
     for _, row in ranking.head(top_n).iterrows():
         lines.append(
             f"{int(row['rank']):<6} {row['strategy']:<10} {row['allocation']:<8} "
-            f"{row['horizon']}M{'':<6} {row['sharpe']:>+10.4f} {row['ic']:>+10.4f} "
-            f"{row['maxdd']:>+10.4f} {row['score']:>10.4f}"
+            f"{row['horizon']}M{'':<6} {row['sharpe']:>+10.2f} {row['ic']*100:>+10.1f}% "
+            f"{row['maxdd']:>+10.1%} {row['score']:>10.1%}"
         )
 
     lines.append("=" * 95)
@@ -702,8 +714,8 @@ def format_ranking_table(
     # Best model summary
     best = ranking.iloc[0]
     lines.append(f"\nBEST MODEL: {best['strategy']} + {best['allocation']} @ {best['horizon']}M")
-    lines.append(f"  Sharpe={best['sharpe']:+.4f}, IC={best['ic']:+.4f}, MaxDD={best['maxdd']:+.4f}")
-    lines.append(f"  Composite Score={best['score']:.4f}")
+    lines.append(f"  Sharpe={best['sharpe']:+.2f}, IC={best['ic']*100:+.1f}%, MaxDD={best['maxdd']:+.1%}")
+    lines.append(f"  Composite Score={best['score']:.1%}")
 
     return "\n".join(lines)
 
@@ -1100,13 +1112,13 @@ def format_tuning_comparison(
     baseline_sharpe = baseline.get('sharpe_ratio', 0)
     tuned_sharpe = tuned_results.get('avg_test_sharpe', 0)
     delta_sharpe = tuned_sharpe - baseline_sharpe
-    lines.append(f"{'Sharpe':<20} {baseline_sharpe:>+15.4f} {tuned_sharpe:>+15.4f} {delta_sharpe:>+15.4f}")
+    lines.append(f"{'Sharpe':<20} {baseline_sharpe:>+15.2f} {tuned_sharpe:>+15.2f} {delta_sharpe:>+15.2f}")
 
     # IC
     baseline_ic = baseline.get('information_coefficient', 0)
     tuned_ic = tuned_results.get('avg_test_ic', 0)
     delta_ic = tuned_ic - baseline_ic
-    lines.append(f"{'IC':<20} {baseline_ic:>+15.4f} {tuned_ic:>+15.4f} {delta_ic:>+15.4f}")
+    lines.append(f"{'IC':<20} {baseline_ic*100:>+15.1f}% {tuned_ic*100:>+15.1f}% {delta_ic*100:>+15.1f}%")
 
     lines.append("=" * 60)
 
@@ -1395,8 +1407,8 @@ def run_combination_walk_forward(
             ))
 
             if verbose:
-                print(f"    Sharpe={metrics.get('sharpe_ratio', 0):+.4f}, "
-                      f"IC={metrics.get('information_coefficient', 0):+.4f}")
+                print(f"    Sharpe={metrics.get('sharpe_ratio', 0):+.2f}, "
+                      f"IC={metrics.get('information_coefficient', 0)*100:+.1f}%")
 
         except Exception as e:
             if verbose:
@@ -1409,7 +1421,7 @@ def run_combination_walk_forward(
         if window_results:
             avg_sharpe = np.mean([r.sharpe for r in window_results])
             avg_ic = np.mean([r.ic for r in window_results])
-            print(f"Avg Sharpe: {avg_sharpe:+.4f}, Avg IC: {avg_ic:+.4f}")
+            print(f"Avg Sharpe: {avg_sharpe:+.2f}, Avg IC: {avg_ic*100:+.1f}%")
 
     return window_results
 
@@ -1434,7 +1446,7 @@ def format_walk_forward_table(results: List[WindowResult]) -> str:
 
     for r in results:
         lines.append(f"{r.window_id:<8} {r.test_year:<12} {r.train_years:<15} "
-                     f"{r.sharpe:>+10.4f} {r.ic:>+10.4f} {r.maxdd:>+10.4f}")
+                     f"{r.sharpe:>+10.2f} {r.ic*100:>+10.1f}% {r.maxdd:>+10.1%}")
 
     lines.append("-" * 80)
 
@@ -1445,14 +1457,14 @@ def format_walk_forward_table(results: List[WindowResult]) -> str:
     pct_positive = sum(1 for r in results if r.sharpe > 0) / len(results) * 100
 
     lines.append(f"\nSUMMARY:")
-    lines.append(f"  Avg Sharpe: {avg_sharpe:+.4f} (±{std_sharpe:.4f})")
-    lines.append(f"  Avg IC: {avg_ic:+.4f}")
+    lines.append(f"  Avg Sharpe: {avg_sharpe:+.2f} (±{std_sharpe:.2f})")
+    lines.append(f"  Avg IC: {avg_ic*100:+.1f}%")
     lines.append(f"  Positive Sharpe: {pct_positive:.0f}% of windows")
 
     best_idx = np.argmax([r.sharpe for r in results])
     worst_idx = np.argmin([r.sharpe for r in results])
-    lines.append(f"  Best year: {results[best_idx].test_year} (Sharpe={results[best_idx].sharpe:+.4f})")
-    lines.append(f"  Worst year: {results[worst_idx].test_year} (Sharpe={results[worst_idx].sharpe:+.4f})")
+    lines.append(f"  Best year: {results[best_idx].test_year} (Sharpe={results[best_idx].sharpe:+.2f})")
+    lines.append(f"  Worst year: {results[worst_idx].test_year} (Sharpe={results[worst_idx].sharpe:+.2f})")
 
     lines.append("=" * 80)
 
@@ -1744,16 +1756,16 @@ def evaluate_on_holdout(
         monthly_rets = monthly_rets.tolist()
     monthly_dates_str = [str(d)[:10] for d in monthly_dates_raw]
 
-    # Calculate total return
+    # Calculate total return (as decimal, e.g., 0.0835 for 8.35%)
     if monthly_rets:
-        total_return = (np.prod(1 + np.array(monthly_rets)) - 1) * 100
+        total_return = np.prod(1 + np.array(monthly_rets)) - 1
     else:
         total_return = 0.0
 
     if verbose:
-        print(f"  Sharpe: {metrics.get('sharpe_ratio', 0):+.4f}")
-        print(f"  IC: {metrics.get('information_coefficient', 0):+.4f}")
-        print(f"  Total Return: {total_return:+.2f}%")
+        print(f"  Sharpe: {metrics.get('sharpe_ratio', 0):+.2f}")
+        print(f"  IC: {metrics.get('information_coefficient', 0)*100:+.1f}%")
+        print(f"  Total Return: {total_return:+.1%}")
 
     return HoldoutResult(
         model_type=model_type,
@@ -1777,14 +1789,15 @@ def ensemble_predict(
     holdout_years: int = 2,
     holdout_start_date: str = None,
     output_type: str = "binary",
+    model_type: str = "ensemble",
     verbose: bool = True,
 ) -> HoldoutResult:
     """
-    Ensemble prediction from N walk-forward models on holdout period.
+    Ensemble prediction from N models on holdout period.
 
     Averages predictions from all models, then computes portfolio returns.
 
-    :param models (List): List of trained models from walk-forward
+    :param models (List): List of trained models
     :param strategy_obj: Strategy object for backtesting
     :param macro_data (pd.DataFrame): Macro features
     :param factor_data (pd.DataFrame): Factor returns
@@ -1793,6 +1806,7 @@ def ensemble_predict(
     :param holdout_years (int): Years in holdout (default: 2, ignored if holdout_start_date set)
     :param holdout_start_date (str): Fixed holdout start date (e.g., "2022-01-01") for comparable periods
     :param output_type (str): 'binary' or 'allocation'
+    :param model_type (str): Label for the ensemble type (default: 'ensemble', use 'fair_ensemble' for fair comparison)
     :param verbose (bool): Print progress
 
     :return result (HoldoutResult): Ensemble holdout evaluation metrics
@@ -1936,8 +1950,8 @@ def ensemble_predict(
     else:
         maxdd = 0.0
 
-    # Total return
-    total_return = (np.prod(1 + returns_arr) - 1) * 100 if len(returns_arr) > 0 else 0.0
+    # Total return (as decimal, e.g., 0.0835 for 8.35%)
+    total_return = (np.prod(1 + returns_arr) - 1) if len(returns_arr) > 0 else 0.0
 
     # IC (correlation between predictions and actuals)
     if output_type == "allocation" and len(avg_weights) > 0:
@@ -1960,12 +1974,12 @@ def ensemble_predict(
         ic = 0.0
 
     if verbose:
-        print(f"  Ensemble Sharpe: {sharpe:+.4f}")
-        print(f"  Ensemble IC: {ic:+.4f}")
-        print(f"  Ensemble Total Return: {total_return:+.2f}%")
+        print(f"  {model_type} Sharpe: {sharpe:+.2f}")
+        print(f"  {model_type} IC: {ic*100:+.1f}%")
+        print(f"  {model_type} Total Return: {total_return:+.1%}")
 
     return HoldoutResult(
-        model_type="ensemble",
+        model_type=model_type,
         sharpe=sharpe,
         ic=ic,
         maxdd=maxdd,
@@ -1997,15 +2011,15 @@ def compare_final_vs_ensemble(
 
     # Sharpe
     delta_sharpe = final_result.sharpe - ensemble_result.sharpe
-    lines.append(f"{'Sharpe':<20} {final_result.sharpe:>+15.4f} {ensemble_result.sharpe:>+15.4f} {delta_sharpe:>+15.4f}")
+    lines.append(f"{'Sharpe':<20} {final_result.sharpe:>+15.2f} {ensemble_result.sharpe:>+15.2f} {delta_sharpe:>+15.2f}")
 
     # Total Return
     delta_return = final_result.total_return - ensemble_result.total_return
-    lines.append(f"{'Total Return (%)':<20} {final_result.total_return:>+15.2f} {ensemble_result.total_return:>+15.2f} {delta_return:>+15.2f}")
+    lines.append(f"{'Total Return':<20} {final_result.total_return:>+15.1%} {ensemble_result.total_return:>+15.1%} {delta_return:>+15.1%}")
 
     # Max Drawdown
     delta_dd = final_result.maxdd - ensemble_result.maxdd
-    lines.append(f"{'Max Drawdown':<20} {final_result.maxdd:>+15.4f} {ensemble_result.maxdd:>+15.4f} {delta_dd:>+15.4f}")
+    lines.append(f"{'Max Drawdown':<20} {final_result.maxdd:>+15.1%} {ensemble_result.maxdd:>+15.1%} {delta_dd:>+15.1%}")
 
     lines.append("-" * 70)
 
@@ -2021,3 +2035,468 @@ def compare_final_vs_ensemble(
     lines.append("=" * 70)
 
     return "\n".join(lines)
+
+
+def train_fair_ensemble_models(
+    strategy: str,
+    allocation: str,
+    horizon: int,
+    macro_data: pd.DataFrame,
+    factor_data: pd.DataFrame,
+    market_data: pd.DataFrame,
+    target_data: pd.DataFrame,
+    cumulative_returns: np.ndarray,
+    indicators: List,
+    feature_engineer: FeatureEngineer,
+    config: Dict,
+    n_models: int = 5,
+    base_seed: int = 42,
+    seed_step: int = 100,
+    holdout_start_date: str = None,
+    holdout_years: int = 2,
+    verbose: bool = True,
+) -> Tuple[List, "FactorAllocationStrategy"]:
+    """
+    Train N models on same data (2000-holdout) with different seeds for fair ensemble.
+
+    This eliminates the data quantity bias present in walk-forward ensembles,
+    where each model sees different amounts of training data.
+
+    :param strategy (str): 'E2E' or 'Sup'
+    :param allocation (str): 'Binary' or 'Multi'
+    :param horizon (int): Prediction horizon
+    :param macro_data (pd.DataFrame): Macro features
+    :param factor_data (pd.DataFrame): Factor returns
+    :param market_data (pd.DataFrame): Market context
+    :param target_data (pd.DataFrame): Target data
+    :param cumulative_returns (np.ndarray): Cumulative returns
+    :param indicators (List): FRED-MD indicators
+    :param feature_engineer (FeatureEngineer): Feature engineer
+    :param config (Dict): Model configuration
+    :param n_models (int): Number of models to train (default: 5)
+    :param base_seed (int): Starting seed (default: 42)
+    :param seed_step (int): Step between seeds (default: 100)
+    :param holdout_start_date (str): Fixed holdout start date (e.g., "2022-01-01")
+    :param holdout_years (int): Years to exclude (default: 2, ignored if holdout_start_date set)
+    :param verbose (bool): Print progress
+
+    :return models (List): List of N trained models
+    :return strategy_obj (FactorAllocationStrategy): Strategy object for backtesting
+    """
+    import copy
+
+    # Determine cutoff date
+    target_data = target_data.copy()
+    target_data['timestamp'] = pd.to_datetime(target_data['timestamp'])
+    data_end_date = target_data['timestamp'].max()
+
+    if holdout_start_date:
+        cutoff_date = holdout_start_date
+        holdout_start_year = int(holdout_start_date[:4])
+    else:
+        data_end_year = data_end_date.year
+        holdout_start_year = data_end_year - holdout_years + 1
+        cutoff_date = f"{holdout_start_year}-01-01"
+
+    # Filter target data to exclude holdout
+    train_targets = target_data[target_data['timestamp'] < cutoff_date].copy()
+
+    if verbose:
+        print(f"\n{'=' * 60}")
+        print(f"TRAINING FAIR ENSEMBLE: {strategy} + {allocation} @ {horizon}M")
+        print(f"Training period: 2000-01-01 to {holdout_start_year - 1}-12-31")
+        print(f"Models: {n_models} with seeds {base_seed}, {base_seed + seed_step}, ...")
+        print(f"{'=' * 60}")
+
+    # Filter factor data for training period
+    factor_ts = factor_data.copy()
+    factor_ts['timestamp'] = pd.to_datetime(factor_ts['timestamp'])
+    train_factor_mask = factor_ts['timestamp'] < cutoff_date
+    train_cum_returns = factor_ts.loc[train_factor_mask, FACTOR_COLUMNS].values
+
+    models = []
+    strategy_obj = None
+
+    for i in range(n_models):
+        seed = base_seed + i * seed_step
+
+        if verbose:
+            print(f"  Training model {i + 1}/{n_models} (seed={seed})...")
+
+        set_seed(seed)
+
+        if strategy == "E2E":
+            strat = FactorAllocationStrategy(
+                region=Region.US,
+                use_fred_md=True,
+                fred_md_indicators=indicators,
+                config={**config, "horizon_months": horizon},
+                verbose=False,
+            )
+            strat.create_model()
+
+            train_ds, val_ds = strat.prepare_data(
+                macro_data, factor_data, market_data, train_targets
+            )
+
+            g = torch.Generator()
+            g.manual_seed(seed)
+
+            train_loader = DataLoader(
+                train_ds,
+                batch_size=config['batch_size'],
+                shuffle=True,
+                collate_fn=collate_fn,
+                drop_last=True,
+                generator=g,
+            )
+            val_loader = DataLoader(
+                val_ds,
+                batch_size=config['batch_size'],
+                shuffle=False,
+                collate_fn=collate_fn,
+            )
+
+            # 3-phase training
+            strat.train_phase1(train_loader, val_loader, verbose=False)
+            strat.train_phase2(train_loader, val_loader, verbose=False)
+            strat.train_phase3(train_loader, val_loader, train_cum_returns, verbose=False)
+
+            models.append(copy.deepcopy(strat.model))
+            if strategy_obj is None:
+                strategy_obj = strat
+
+        else:  # Supervised
+            model = FactorAllocationTransformer(
+                num_indicators=feature_engineer.get_num_indicators(),
+                num_factors=config['num_factors'],
+                d_model=config['d_model'],
+                num_heads=config['num_heads'],
+                num_layers=config['num_layers'],
+                d_ff=config['d_ff'],
+                dropout=config['dropout'],
+                max_seq_len=config['sequence_length'],
+            )
+
+            training_config = TrainingConfig(
+                learning_rate=config['learning_rate'],
+                batch_size=config['batch_size'],
+                weight_decay=config['weight_decay'],
+                epochs_phase1=config['epochs_phase1'],
+                epochs_phase2=config['epochs_phase2'],
+                epochs_phase3=config['epochs_phase3'],
+                horizon_months=horizon,
+            )
+
+            trainer = SupervisedTrainer(
+                model=model,
+                config=training_config,
+                device=torch.device('cpu'),
+                verbose=False,
+            )
+
+            strat_sup = FactorAllocationStrategy(
+                region=Region.US,
+                use_fred_md=True,
+                fred_md_indicators=indicators,
+                config=config,
+                verbose=False,
+            )
+            strat_sup.create_model()
+
+            train_ds, val_ds = strat_sup.prepare_data(
+                macro_data, factor_data, market_data, train_targets
+            )
+
+            g = torch.Generator()
+            g.manual_seed(seed)
+
+            train_loader = DataLoader(
+                train_ds,
+                batch_size=config['batch_size'],
+                shuffle=True,
+                collate_fn=collate_fn,
+                drop_last=True,
+                generator=g,
+            )
+            val_loader = DataLoader(
+                val_ds,
+                batch_size=config['batch_size'],
+                shuffle=False,
+                collate_fn=collate_fn,
+            )
+
+            # Compute targets
+            train_dates = train_targets['timestamp'].tolist()
+            opt_weights = trainer.compute_targets(
+                factor_data, train_dates, horizon_months=horizon
+            )
+
+            trainer.train(train_loader, val_loader, opt_weights, train_dates, verbose=False)
+
+            models.append(copy.deepcopy(model))
+            if strategy_obj is None:
+                strat_sup.model = model
+                strategy_obj = strat_sup
+
+    if verbose:
+        print(f"  Fair ensemble training complete ({n_models} models).")
+
+    return models, strategy_obj
+
+
+@dataclass
+class BiasAnalysisResult:
+    """Results from bias analysis comparing data quantity, seed, and ensemble effects."""
+    combination: str
+    # Data quantity effect
+    data_quantity_results: Dict[int, float]  # cutoff_year -> sharpe
+    data_quantity_correlation: float
+    # Seed variance effect
+    seed_results: Dict[int, float]  # seed -> sharpe
+    seed_mean: float
+    seed_std: float
+    # Effect decomposition
+    final_sharpe: float
+    fair_ensemble_sharpe: float
+    wf_ensemble_sharpe: float
+    pure_ensemble_effect: float  # final - fair_ensemble
+    data_confound: float  # fair_ensemble - wf_ensemble
+
+
+def run_bias_analysis(
+    strategy: str,
+    allocation: str,
+    horizon: int,
+    macro_data: pd.DataFrame,
+    factor_data: pd.DataFrame,
+    market_data: pd.DataFrame,
+    target_data: pd.DataFrame,
+    cumulative_returns: np.ndarray,
+    indicators: List,
+    feature_engineer: FeatureEngineer,
+    config: Dict,
+    final_result: HoldoutResult,
+    fair_ensemble_models: List,
+    fair_ensemble_result: HoldoutResult,
+    wf_ensemble_result: HoldoutResult = None,
+    cutoff_years: List[int] = None,
+    holdout_start_date: str = "2022-01-01",
+    verbose: bool = True,
+) -> BiasAnalysisResult:
+    """
+    Analyze biases in Final vs Ensemble comparison by isolating effects.
+
+    Runs 3 analyses:
+    1. Data quantity effect: Train models with same seed, different data cutoffs
+    2. Seed variance: Use fair_ensemble_models to compute variance across seeds
+    3. Effect decomposition: Compare Final vs Fair Ensemble vs WF Ensemble
+
+    :param strategy (str): 'E2E' or 'Sup'
+    :param allocation (str): 'Binary' or 'Multi'
+    :param horizon (int): Prediction horizon
+    :param macro_data (pd.DataFrame): Macro features
+    :param factor_data (pd.DataFrame): Factor returns
+    :param market_data (pd.DataFrame): Market context
+    :param target_data (pd.DataFrame): Target data
+    :param cumulative_returns (np.ndarray): Cumulative returns
+    :param indicators (List): FRED-MD indicators
+    :param feature_engineer (FeatureEngineer): Feature engineer
+    :param config (Dict): Model configuration
+    :param final_result (HoldoutResult): Result from Final model
+    :param fair_ensemble_models (List): Models from train_fair_ensemble_models
+    :param fair_ensemble_result (HoldoutResult): Result from fair ensemble
+    :param wf_ensemble_result (HoldoutResult): Result from WF ensemble (optional)
+    :param cutoff_years (List[int]): Years for data quantity analysis (default: [2014, 2017, 2020])
+    :param holdout_start_date (str): Holdout start date
+    :param verbose (bool): Print progress
+
+    :return result (BiasAnalysisResult): Complete bias analysis
+    """
+    import copy
+
+    if cutoff_years is None:
+        cutoff_years = [2014, 2017, 2020]
+
+    combination = f"{strategy} + {allocation} @ {horizon}M"
+
+    if verbose:
+        print(f"\n{'=' * 70}")
+        print(f"BIAS ANALYSIS: {combination}")
+        print(f"{'=' * 70}")
+
+    # 1. DATA QUANTITY EFFECT
+    # Train models with same seed (999), different data cutoffs
+    if verbose:
+        print(f"\n1. DATA QUANTITY EFFECT (seed=999)")
+        print("-" * 50)
+
+    data_quantity_results = {}
+    output_type = "binary" if allocation == "Binary" else "allocation"
+
+    # We need to store the strategy object for later use
+    strat_obj = None
+
+    for cutoff_year in cutoff_years:
+        # Train on data up to cutoff_year (exclusive of next year)
+        train_cutoff_date = f"{cutoff_year + 1}-01-01"
+
+        if verbose:
+            print(f"  Training model with data up to {cutoff_year}...")
+
+        # Train model with this cutoff (uses holdout_start_date as training cutoff)
+        model, strat_obj = train_final_model(
+            strategy=strategy,
+            allocation=allocation,
+            horizon=horizon,
+            macro_data=macro_data,
+            factor_data=factor_data,
+            market_data=market_data,
+            target_data=target_data,
+            cumulative_returns=cumulative_returns,
+            indicators=indicators,
+            feature_engineer=feature_engineer,
+            config=config,
+            holdout_start_date=train_cutoff_date,
+            verbose=False,
+        )
+
+        # Evaluate on the actual holdout period
+        result = evaluate_on_holdout(
+            model=model,
+            strategy_obj=strat_obj,
+            macro_data=macro_data,
+            factor_data=factor_data,
+            market_data=market_data,
+            target_data=target_data,
+            holdout_start_date=holdout_start_date,
+            output_type=output_type,
+            model_type=f"cutoff_{cutoff_year}",
+            verbose=False,
+        )
+
+        data_quantity_results[cutoff_year] = result.sharpe
+
+        if verbose:
+            print(f"    Cutoff {cutoff_year}: Sharpe = {result.sharpe:+.2f}")
+
+    # Add final model result (uses all data up to holdout)
+    holdout_year = int(holdout_start_date[:4])
+    data_quantity_results[holdout_year - 1] = final_result.sharpe
+
+    if verbose:
+        print(f"    Cutoff {holdout_year - 1}: Sharpe = {final_result.sharpe:+.2f} (Final)")
+
+    # Compute correlation between years and sharpe
+    years = sorted(data_quantity_results.keys())
+    sharpes = [data_quantity_results[y] for y in years]
+    if len(years) > 1:
+        data_corr = np.corrcoef(years, sharpes)[0, 1]
+        if np.isnan(data_corr):
+            data_corr = 0.0
+    else:
+        data_corr = 0.0
+
+    if verbose:
+        print(f"  Correlation (years vs Sharpe): {data_corr:+.4f}")
+
+    # 2. SEED VARIANCE EFFECT
+    # Use fair ensemble models to compute variance
+    if verbose:
+        print(f"\n2. SEED VARIANCE EFFECT (2000-{holdout_year - 1} data)")
+        print("-" * 50)
+
+    seed_results = {}
+    base_seed = 42
+    seed_step = 100
+
+    for i, model in enumerate(fair_ensemble_models):
+        seed = base_seed + i * seed_step
+
+        # Evaluate this single model on holdout
+        result = evaluate_on_holdout(
+            model=model,
+            strategy_obj=strat_obj,
+            macro_data=macro_data,
+            factor_data=factor_data,
+            market_data=market_data,
+            target_data=target_data,
+            holdout_start_date=holdout_start_date,
+            output_type=output_type,
+            model_type=f"seed_{seed}",
+            verbose=False,
+        )
+
+        seed_results[seed] = result.sharpe
+
+        if verbose:
+            print(f"    Seed {seed}: Sharpe = {result.sharpe:+.2f}")
+
+    seed_mean = np.mean(list(seed_results.values()))
+    seed_std = np.std(list(seed_results.values()))
+
+    if verbose:
+        print(f"  Mean: {seed_mean:+.4f} (std: {seed_std:.4f})")
+
+    # 3. EFFECT DECOMPOSITION
+    if verbose:
+        print(f"\n3. EFFECT DECOMPOSITION")
+        print("-" * 50)
+
+    pure_ensemble_effect = final_result.sharpe - fair_ensemble_result.sharpe
+
+    if wf_ensemble_result is not None:
+        data_confound = fair_ensemble_result.sharpe - wf_ensemble_result.sharpe
+        wf_sharpe = wf_ensemble_result.sharpe
+    else:
+        data_confound = 0.0
+        wf_sharpe = 0.0
+
+    if verbose:
+        print(f"  Final (seed=999):     {final_result.sharpe:+.2f}")
+        print(f"  Fair Ensemble:        {fair_ensemble_result.sharpe:+.2f}")
+        if wf_ensemble_result is not None:
+            print(f"  WF Ensemble:          {wf_sharpe:+.2f}")
+        print(f"\n  Pure ensemble effect: {pure_ensemble_effect:+.2f} (Final - Fair)")
+        if wf_ensemble_result is not None:
+            print(f"  Data confound:        {data_confound:+.2f} (Fair - WF)")
+
+    if verbose:
+        print(f"\n{'=' * 70}")
+        print("CONCLUSIONS:")
+        if data_corr > 0.5:
+            print("  - More training data improves performance")
+        elif data_corr < -0.5:
+            print("  - More training data hurts performance (possible overfitting)")
+        else:
+            print("  - Data quantity effect is unclear")
+
+        if seed_std > 0.05:
+            print(f"  - Significant seed variance ({seed_std:.2%} of mean)")
+        else:
+            print(f"  - Low seed variance ({seed_std:.2%} of mean)")
+
+        if abs(pure_ensemble_effect) < 0.02:
+            print("  - Pure ensemble effect is negligible")
+        elif pure_ensemble_effect > 0:
+            print("  - Single model outperforms ensemble")
+        else:
+            print("  - Ensemble outperforms single model")
+
+        if wf_ensemble_result is not None and abs(data_confound) > 0.03:
+            print(f"  - WF ensemble bias: {data_confound*100:+.1f}% Sharpe from data quantity")
+        print(f"{'=' * 70}")
+
+    return BiasAnalysisResult(
+        combination=combination,
+        data_quantity_results=data_quantity_results,
+        data_quantity_correlation=data_corr,
+        seed_results=seed_results,
+        seed_mean=seed_mean,
+        seed_std=seed_std,
+        final_sharpe=final_result.sharpe,
+        fair_ensemble_sharpe=fair_ensemble_result.sharpe,
+        wf_ensemble_sharpe=wf_sharpe,
+        pure_ensemble_effect=pure_ensemble_effect,
+        data_confound=data_confound,
+    )

@@ -17,12 +17,15 @@ import pandas as pd
 from comparison_runner import (
     run_combination_walk_forward,
     train_final_model,
+    train_fair_ensemble_models,
     evaluate_on_holdout,
     ensemble_predict,
     prepare_data,
     compute_composite_score,
+    run_bias_analysis,
     WindowResult,
     HoldoutResult,
+    BiasAnalysisResult,
 )
 from features.feature_engineering import FeatureEngineer
 from data.factor_data_loader import FactorDataLoader
@@ -39,6 +42,14 @@ class EvaluationConfig:
     allocations: List[str] = field(default_factory=lambda: ["Binary", "Multi"])
     save_models: bool = True
     verbose: bool = True
+    # Fair ensemble configuration
+    train_fair_ensemble: bool = True
+    fair_ensemble_n_models: int = 5
+    fair_ensemble_base_seed: int = 42
+    fair_ensemble_seed_step: int = 100
+    # Bias analysis configuration
+    run_bias_analysis: bool = False
+    bias_cutoff_years: List[int] = field(default_factory=lambda: [2014, 2017, 2020])
 
 
 @dataclass
@@ -46,10 +57,12 @@ class ThreeStepResults:
     """Container for all three-step evaluation results."""
     walk_forward_results: Dict[Tuple[str, str, int], List[WindowResult]]
     final_models: Dict[Tuple[str, str, int], Dict[str, Any]]
+    fair_ensemble_models: Dict[Tuple[str, str, int], Dict[str, Any]]
     holdout_results: Dict[Tuple[str, str, int], Dict[str, HoldoutResult]]
     walk_forward_summary: pd.DataFrame
     holdout_summary: pd.DataFrame
     best_combination: Tuple[str, str, int]
+    bias_analysis: Optional[Dict[Tuple[str, str, int], BiasAnalysisResult]] = None
 
 
 class ThreeStepEvaluation:
@@ -101,7 +114,9 @@ class ThreeStepEvaluation:
         # Results storage
         self.wf_results: Dict[Tuple[str, str, int], List[WindowResult]] = {}
         self.final_models: Dict[Tuple[str, str, int], Dict[str, Any]] = {}
+        self.fair_ensemble_models: Dict[Tuple[str, str, int], Dict[str, Any]] = {}
         self.holdout_results: Dict[Tuple[str, str, int], Dict[str, HoldoutResult]] = {}
+        self.bias_results: Dict[Tuple[str, str, int], BiasAnalysisResult] = {}
 
     def run_step1_walk_forward(self) -> Dict[Tuple[str, str, int], List[WindowResult]]:
         """
@@ -215,7 +230,10 @@ class ThreeStepEvaluation:
 
     def run_step3_holdout(self) -> Dict[Tuple[str, str, int], Dict[str, HoldoutResult]]:
         """
-        Step 3: Evaluate Final vs Ensemble on holdout period.
+        Step 3: Train Fair Ensemble and evaluate Final vs Fair Ensemble vs WF Ensemble.
+
+        If train_fair_ensemble is True, trains N models on same data (2000-holdout)
+        with different seeds for a fair comparison.
 
         :return holdout_results (Dict): Holdout results per combination
         """
@@ -224,7 +242,10 @@ class ThreeStepEvaluation:
             print("\n" + "=" * 80)
             print("STEP 3: HOLDOUT EVALUATION")
             print("=" * 80)
-            print(f"Evaluating all {len(config.strategies) * len(config.allocations) * len(config.horizons)} combinations on holdout period...")
+            if config.train_fair_ensemble:
+                print(f"Training Fair Ensemble ({config.fair_ensemble_n_models} models) + evaluating on holdout")
+            else:
+                print("Evaluating Final vs WF Ensemble on holdout")
             print(f"Holdout start: {config.holdout_start_date}\n")
 
         total = len(config.strategies) * len(config.allocations) * len(config.horizons)
@@ -245,13 +266,8 @@ class ThreeStepEvaluation:
                             print("  No final model available, skipping...")
                         continue
 
-                    if key not in self.wf_results or not self.wf_results[key]:
-                        if config.verbose:
-                            print("  No walk-forward models available, skipping...")
-                        continue
-
                     final_data = self.final_models[key]
-                    wf_results = self.wf_results[key]
+                    wf_results = self.wf_results.get(key, [])
 
                     try:
                         # Evaluate Final model
@@ -268,11 +284,56 @@ class ThreeStepEvaluation:
                             verbose=config.verbose,
                         )
 
-                        # Evaluate Ensemble
+                        # Train and evaluate Fair Ensemble if configured
+                        fair_ensemble_holdout = None
+                        if config.train_fair_ensemble:
+                            if config.verbose:
+                                print(f"  Training Fair Ensemble ({config.fair_ensemble_n_models} models)...")
+
+                            fair_models, fair_strategy = train_fair_ensemble_models(
+                                strategy=strategy,
+                                allocation=allocation,
+                                horizon=horizon,
+                                macro_data=self.macro_data,
+                                factor_data=self.factor_data,
+                                market_data=self.market_data,
+                                target_data=self.targets[horizon],
+                                cumulative_returns=self.cumulative_returns[horizon],
+                                indicators=self.indicators,
+                                feature_engineer=self.feature_engineer,
+                                config=self.model_config,
+                                n_models=config.fair_ensemble_n_models,
+                                base_seed=config.fair_ensemble_base_seed,
+                                seed_step=config.fair_ensemble_seed_step,
+                                holdout_start_date=config.holdout_start_date,
+                                verbose=False,
+                            )
+
+                            self.fair_ensemble_models[key] = {
+                                'models': fair_models,
+                                'strategy_obj': fair_strategy,
+                            }
+
+                            # Evaluate Fair Ensemble
+                            fair_ensemble_holdout = ensemble_predict(
+                                models=fair_models,
+                                strategy_obj=fair_strategy,
+                                macro_data=self.macro_data,
+                                factor_data=self.factor_data,
+                                market_data=self.market_data,
+                                target_data=self.targets[horizon],
+                                holdout_start_date=config.holdout_start_date,
+                                output_type=output_type,
+                                model_type="fair_ensemble",
+                                verbose=config.verbose,
+                            )
+
+                        # Evaluate WF Ensemble
+                        wf_ensemble_holdout = None
                         ensemble_models = [r.model for r in wf_results if r.model is not None]
 
                         if ensemble_models:
-                            ensemble_holdout = ensemble_predict(
+                            wf_ensemble_holdout = ensemble_predict(
                                 models=ensemble_models,
                                 strategy_obj=final_data['strategy_obj'],
                                 macro_data=self.macro_data,
@@ -281,22 +342,88 @@ class ThreeStepEvaluation:
                                 target_data=self.targets[horizon],
                                 holdout_start_date=config.holdout_start_date,
                                 output_type=output_type,
+                                model_type="wf_ensemble",
                                 verbose=config.verbose,
                             )
-                        else:
-                            ensemble_holdout = None
 
                         self.holdout_results[key] = {
                             'final': final_holdout,
-                            'ensemble': ensemble_holdout,
+                            'fair_ensemble': fair_ensemble_holdout,
+                            'wf_ensemble': wf_ensemble_holdout,
                         }
 
                     except Exception as e:
                         if config.verbose:
                             print(f"  Error during evaluation: {e}")
+                        import traceback
+                        traceback.print_exc()
                         self.holdout_results[key] = None
 
         return self.holdout_results
+
+    def run_step4_bias_analysis(self) -> Dict[Tuple[str, str, int], BiasAnalysisResult]:
+        """
+        Step 4 (Optional): Run bias analysis for all combinations.
+
+        Analyzes data quantity effect, seed variance, and pure ensemble effect.
+
+        :return bias_results (Dict): Bias analysis results per combination
+        """
+        config = self.eval_config
+        if config.verbose:
+            print("\n" + "=" * 80)
+            print("STEP 4: BIAS ANALYSIS")
+            print("=" * 80)
+            print(f"Analyzing {len(self.holdout_results)} combinations...")
+
+        for key, holdout in self.holdout_results.items():
+            if holdout is None:
+                continue
+
+            strategy, allocation, horizon = key
+
+            # Skip if we don't have all necessary data
+            if key not in self.fair_ensemble_models:
+                if config.verbose:
+                    print(f"  Skipping {key}: No fair ensemble models")
+                continue
+
+            final = holdout.get('final')
+            fair_ensemble = holdout.get('fair_ensemble')
+            wf_ensemble = holdout.get('wf_ensemble')
+
+            if not final or not fair_ensemble:
+                continue
+
+            try:
+                bias_result = run_bias_analysis(
+                    strategy=strategy,
+                    allocation=allocation,
+                    horizon=horizon,
+                    macro_data=self.macro_data,
+                    factor_data=self.factor_data,
+                    market_data=self.market_data,
+                    target_data=self.targets[horizon],
+                    cumulative_returns=self.cumulative_returns[horizon],
+                    indicators=self.indicators,
+                    feature_engineer=self.feature_engineer,
+                    config=self.model_config,
+                    final_result=final,
+                    fair_ensemble_models=self.fair_ensemble_models[key]['models'],
+                    fair_ensemble_result=fair_ensemble,
+                    wf_ensemble_result=wf_ensemble,
+                    cutoff_years=config.bias_cutoff_years,
+                    holdout_start_date=config.holdout_start_date,
+                    verbose=config.verbose,
+                )
+
+                self.bias_results[key] = bias_result
+
+            except Exception as e:
+                if config.verbose:
+                    print(f"  Error analyzing {key}: {e}")
+
+        return self.bias_results
 
     def run_all(self) -> ThreeStepResults:
         """
@@ -310,8 +437,12 @@ class ThreeStepEvaluation:
         # Step 2
         self.run_step2_final_models()
 
-        # Step 3
+        # Step 3 (includes Fair Ensemble training if configured)
         self.run_step3_holdout()
+
+        # Step 4 (optional)
+        if self.eval_config.run_bias_analysis:
+            self.run_step4_bias_analysis()
 
         # Generate summaries
         wf_summary = self._build_walk_forward_summary()
@@ -327,10 +458,12 @@ class ThreeStepEvaluation:
         return ThreeStepResults(
             walk_forward_results=self.wf_results,
             final_models=self.final_models,
+            fair_ensemble_models=self.fair_ensemble_models,
             holdout_results=self.holdout_results,
             walk_forward_summary=wf_summary,
             holdout_summary=holdout_summary,
             best_combination=best_combo,
+            bias_analysis=self.bias_results if self.bias_results else None,
         )
 
     def _compute_true_oos_sharpe(self, results_list: List[WindowResult]) -> float:
@@ -404,8 +537,10 @@ class ThreeStepEvaluation:
 
             strategy, allocation, horizon = key
             final = results.get('final')
-            ensemble = results.get('ensemble')
+            fair_ensemble = results.get('fair_ensemble')
+            wf_ensemble = results.get('wf_ensemble')
 
+            n_samples = 0
             if final:
                 n_samples = len(final.monthly_returns) if final.monthly_returns else 0
                 holdout_data.append({
@@ -420,17 +555,30 @@ class ThreeStepEvaluation:
                     'total_return': final.total_return,
                 })
 
-            if ensemble:
+            if fair_ensemble:
                 holdout_data.append({
                     'strategy': strategy,
                     'allocation': allocation,
                     'horizon': horizon,
-                    'model_type': 'Ensemble',
-                    'samples': n_samples if final else 0,
-                    'sharpe': ensemble.sharpe,
-                    'ic': ensemble.ic,
-                    'maxdd': ensemble.maxdd,
-                    'total_return': ensemble.total_return,
+                    'model_type': 'Fair Ensemble',
+                    'samples': n_samples,
+                    'sharpe': fair_ensemble.sharpe,
+                    'ic': fair_ensemble.ic,
+                    'maxdd': fair_ensemble.maxdd,
+                    'total_return': fair_ensemble.total_return,
+                })
+
+            if wf_ensemble:
+                holdout_data.append({
+                    'strategy': strategy,
+                    'allocation': allocation,
+                    'horizon': horizon,
+                    'model_type': 'WF Ensemble',
+                    'samples': n_samples,
+                    'sharpe': wf_ensemble.sharpe,
+                    'ic': wf_ensemble.ic,
+                    'maxdd': wf_ensemble.maxdd,
+                    'total_return': wf_ensemble.total_return,
                 })
 
         holdout_df = pd.DataFrame(holdout_data)
