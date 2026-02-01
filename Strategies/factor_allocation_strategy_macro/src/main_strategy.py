@@ -641,18 +641,21 @@ class FactorAllocationStrategy:
                         portfolio_returns.append(0.0)
 
                 elif output_type == "binary":
-                    # Binary mode: only cyclical vs defensive (legacy)
+                    # Binary mode: cyclical vs defensive allocation
+                    # Use prediction probability as weight (not hard threshold)
+                    # This allows different horizons to produce different results
+                    # because the magnitude of pred matters, not just direction
                     output = self.model(macro_tensor, market_tensor, output_type="binary")
                     pred = output.cpu().numpy().flatten()[0]
                     predictions.append(pred)
                     actuals.append(row["target"])
 
-                    # Equal weight to cyclical or defensive
+                    # Weighted allocation: pred = weight for cyclical, (1-pred) = weight for defensive
                     if len(factor_row) > 0:
-                        if pred > 0.5:
-                            portfolio_returns.append(factor_row.iloc[0].get("cyclical", 0))
-                        else:
-                            portfolio_returns.append(factor_row.iloc[0].get("defensive", 0))
+                        cyclical_ret = factor_row.iloc[0].get("cyclical", 0)
+                        defensive_ret = factor_row.iloc[0].get("defensive", 0)
+                        portfolio_return = pred * cyclical_ret + (1 - pred) * defensive_ret
+                        portfolio_returns.append(portfolio_return)
                     else:
                         portfolio_returns.append(0.0)
 

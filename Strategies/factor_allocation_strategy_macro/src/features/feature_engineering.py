@@ -19,6 +19,12 @@ from data.data_loader import (
     Periodicity,
     Region,
 )
+from features.feature_selection import (
+    IndicatorSelector,
+    PCAFeatureReducer,
+    SelectionConfig,
+    PCAConfig,
+)
 
 
 @dataclass
@@ -463,3 +469,103 @@ class FeatureEngineer:
         :return count (int): Number of periodicities
         """
         return len(Periodicity)
+
+    def create_indicator_selector(
+        self,
+        macro_data: pd.DataFrame,
+        target_data: pd.DataFrame,
+        factor_data: Optional[pd.DataFrame] = None,
+        method: str = "mutual_info",
+        n_features: int = 30,
+    ) -> IndicatorSelector:
+        """
+        Create and fit an indicator selector for dimensionality reduction.
+
+        :param macro_data (pd.DataFrame): Macro token data
+        :param target_data (pd.DataFrame): Target data with timestamps and targets
+        :param factor_data (pd.DataFrame): Optional factor returns for correlation method
+        :param method (str): Selection method ('mutual_info', 'correlation', 'variance')
+        :param n_features (int): Number of indicators to select
+
+        :return selector (IndicatorSelector): Fitted indicator selector
+        """
+        config = SelectionConfig(method=method, n_features=n_features)
+        selector = IndicatorSelector(config)
+        selector.fit(macro_data, target_data, factor_data)
+        return selector
+
+    def create_pca_reducer(
+        self,
+        macro_data: pd.DataFrame,
+        factor_data: pd.DataFrame,
+        market_data: pd.DataFrame,
+        target_data: pd.DataFrame,
+        n_components: int = 20,
+    ) -> PCAFeatureReducer:
+        """
+        Create and fit a PCA reducer on flat features.
+
+        :param macro_data (pd.DataFrame): Macro token data
+        :param factor_data (pd.DataFrame): Factor returns
+        :param market_data (pd.DataFrame): Market context
+        :param target_data (pd.DataFrame): Target data with timestamps
+        :param n_components (int): Number of PCA components to keep
+
+        :return reducer (PCAFeatureReducer): Fitted PCA reducer
+        """
+        # Generate flat features for all target dates
+        features_list = []
+        for _, row in target_data.iterrows():
+            as_of_date = row["timestamp"]
+            features = self.create_flat_features(
+                macro_data, factor_data, market_data, as_of_date
+            )
+            features_list.append(features)
+
+        X = np.array(features_list)
+
+        # Fit PCA
+        config = PCAConfig(n_components=n_components, whiten=False)
+        reducer = PCAFeatureReducer(config)
+        reducer.fit(X)
+
+        return reducer
+
+    def apply_indicator_selection(
+        self,
+        macro_data: pd.DataFrame,
+        selector: IndicatorSelector,
+    ) -> pd.DataFrame:
+        """
+        Apply indicator selection to filter macro data.
+
+        :param macro_data (pd.DataFrame): Raw macro data
+        :param selector (IndicatorSelector): Fitted indicator selector
+
+        :return filtered_data (pd.DataFrame): Filtered macro data
+        """
+        return selector.transform(macro_data)
+
+    def create_flat_features_with_pca(
+        self,
+        macro_data: pd.DataFrame,
+        factor_data: pd.DataFrame,
+        market_data: pd.DataFrame,
+        as_of_date: pd.Timestamp,
+        reducer: PCAFeatureReducer,
+    ) -> np.ndarray:
+        """
+        Create flat features and apply PCA reduction.
+
+        :param macro_data (pd.DataFrame): Macro token data
+        :param factor_data (pd.DataFrame): Factor returns
+        :param market_data (pd.DataFrame): Market context
+        :param as_of_date (pd.Timestamp): Point-in-time date
+        :param reducer (PCAFeatureReducer): Fitted PCA reducer
+
+        :return features (np.ndarray): PCA-reduced feature vector
+        """
+        raw_features = self.create_flat_features(
+            macro_data, factor_data, market_data, as_of_date
+        )
+        return reducer.transform(raw_features.reshape(1, -1)).flatten()

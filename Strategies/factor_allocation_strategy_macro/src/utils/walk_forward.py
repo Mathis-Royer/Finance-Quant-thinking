@@ -12,7 +12,7 @@ Walk-forward validation uses expanding or rolling windows:
 - Repeat with expanding or sliding window
 """
 
-from typing import Dict, List, Optional, Tuple, Any, Callable
+from typing import Dict, List, Optional, Tuple, Callable
 from dataclasses import dataclass
 import numpy as np
 import pandas as pd
@@ -103,22 +103,35 @@ class WalkForwardValidator:
         data_end: str,
         initial_train_years: int = 14,
         val_years: int = 3,
+        test_years: int = 1,
         step_years: int = 1,
+        holdout_years: int = 0,
     ) -> List[WalkForwardWindow]:
         """
-        Create expanding window schedule.
+        Create expanding window schedule with NON-OVERLAPPING test periods.
+
+        Each window has a distinct test period (default 1 year) to ensure
+        truly out-of-sample evaluation without data leakage.
 
         :param data_start (str): Data start date
         :param data_end (str): Data end date
         :param initial_train_years (int): Initial training period
         :param val_years (int): Validation period length
+        :param test_years (int): Test period length (non-overlapping)
         :param step_years (int): Step size between windows
+        :param holdout_years (int): Years to reserve at end (no model sees these)
 
         :return windows (List[WalkForwardWindow]): Generated windows
         """
         windows = []
         start = pd.Timestamp(data_start)
         end = pd.Timestamp(data_end)
+
+        # Reserve holdout period at the end
+        if holdout_years > 0:
+            effective_end = pd.Timestamp(f"{end.year - holdout_years}-12-31")
+        else:
+            effective_end = end
 
         train_end_year = start.year + initial_train_years - 1
 
@@ -127,9 +140,16 @@ class WalkForwardValidator:
             val_start = pd.Timestamp(f"{train_end_year + 1}-01-01")
             val_end = pd.Timestamp(f"{train_end_year + val_years}-12-31")
             test_start = pd.Timestamp(f"{train_end_year + val_years + 1}-01-01")
+            # Non-overlapping test: exactly test_years
+            test_end = pd.Timestamp(f"{train_end_year + val_years + test_years}-12-31")
 
-            if test_start >= end:
+            # Stop if test period exceeds effective end (before holdout)
+            if test_start > effective_end:
                 break
+
+            # Clamp test_end to effective_end if needed
+            if test_end > effective_end:
+                test_end = effective_end
 
             window = WalkForwardWindow(
                 train_start=data_start,
@@ -137,7 +157,7 @@ class WalkForwardValidator:
                 val_start=str(val_start.date()),
                 val_end=str(val_end.date()),
                 test_start=str(test_start.date()),
-                test_end=data_end,
+                test_end=str(test_end.date()),
             )
             windows.append(window)
 

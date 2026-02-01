@@ -349,6 +349,48 @@ class PerformanceMetrics:
         }
 
     @staticmethod
+    def total_return(returns: np.ndarray) -> float:
+        """
+        Calculate total return from a series of period returns.
+
+        :param returns (np.ndarray): Period returns
+
+        :return total (float): Total cumulative return
+        """
+        if len(returns) == 0:
+            return 0.0
+        return np.prod(1 + np.array(returns)) - 1
+
+    @staticmethod
+    def cumulative_returns(returns: np.ndarray) -> np.ndarray:
+        """
+        Calculate cumulative return series from period returns.
+
+        :param returns (np.ndarray): Period returns
+
+        :return cumulative (np.ndarray): Cumulative return series (wealth path)
+        """
+        if len(returns) == 0:
+            return np.array([1.0])
+        return np.cumprod(1 + np.array(returns))
+
+    @staticmethod
+    def max_drawdown_from_returns(returns: np.ndarray) -> float:
+        """
+        Calculate maximum drawdown directly from period returns.
+
+        :param returns (np.ndarray): Period returns
+
+        :return max_dd (float): Maximum drawdown (negative number)
+        """
+        if len(returns) == 0:
+            return 0.0
+        cum_ret = np.cumprod(1 + np.array(returns))
+        running_max = np.maximum.accumulate(cum_ret)
+        drawdown = cum_ret / running_max - 1
+        return drawdown.min()
+
+    @staticmethod
     def rolling_metrics(
         returns: np.ndarray,
         window: int = 52,
@@ -380,3 +422,52 @@ class PerformanceMetrics:
             "rolling_volatility": rolling_vol,
             "rolling_return": rolling_return,
         }
+
+
+# Convenience functions for direct import
+def compute_total_return(returns: np.ndarray) -> float:
+    """
+    Calculate total return from a series of period returns.
+
+    :param returns (np.ndarray): Period returns
+
+    :return total (float): Total cumulative return
+    """
+    return PerformanceMetrics.total_return(returns)
+
+
+def compute_cumulative_returns(returns: np.ndarray) -> np.ndarray:
+    """
+    Calculate cumulative return series from period returns.
+
+    :param returns (np.ndarray): Period returns
+
+    :return cumulative (np.ndarray): Cumulative return series (wealth path)
+    """
+    return PerformanceMetrics.cumulative_returns(returns)
+
+
+def compute_max_drawdown(returns: np.ndarray) -> float:
+    """
+    Calculate maximum drawdown from period returns.
+
+    :param returns (np.ndarray): Period returns
+
+    :return max_dd (float): Maximum drawdown (negative number)
+    """
+    return PerformanceMetrics.max_drawdown_from_returns(returns)
+
+
+def compute_sharpe_ratio(
+    returns: np.ndarray,
+    periods_per_year: int = 12,
+) -> float:
+    """
+    Calculate annualized Sharpe ratio.
+
+    :param returns (np.ndarray): Period returns
+    :param periods_per_year (int): Number of periods per year (12=monthly)
+
+    :return sharpe (float): Annualized Sharpe ratio
+    """
+    return PerformanceMetrics.sharpe_ratio(returns, periods_per_year=periods_per_year)
