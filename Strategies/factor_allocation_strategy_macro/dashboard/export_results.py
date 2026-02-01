@@ -6,7 +6,7 @@ This script is called from the notebook after running the three-step evaluation.
 
 import sys
 from pathlib import Path
-from typing import Dict, Any, Tuple
+from typing import Dict, Any, Tuple, Union
 
 import pandas as pd
 
@@ -14,15 +14,17 @@ import pandas as pd
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root / "src"))
 
+from utils.keys import unpack_key as _unpack_key
+
 
 def export_holdout_results_to_cache(
-    all_holdout_results: Dict[Tuple[str, str, int], Dict[str, Any]],
+    all_holdout_results: Dict[Union[Tuple[str, str, int], Tuple[str, str, int, str]], Dict[str, Any]],
     output_path: Path = None,
 ) -> Path:
     """
     Export holdout results to parquet for dashboard.
 
-    :param all_holdout_results (Dict): Holdout results from ThreeStepEvaluation
+    :param all_holdout_results (Dict): Holdout results from ThreeStepEvaluation (3-tuple or 4-tuple keys)
     :param output_path (Path): Output path (default: data_cache/holdout_results.parquet)
 
     :return output_path (Path): Path where results were saved
@@ -44,7 +46,8 @@ def export_holdout_results_to_cache(
         if results is None:
             continue
 
-        strategy, allocation, horizon = key
+        # Handle both 3-tuple (legacy) and 4-tuple keys
+        strategy, allocation, horizon, config_name = _unpack_key(key)
 
         for model_type_key, model_type_name in type_map.items():
             result = results.get(model_type_key)
@@ -62,6 +65,7 @@ def export_holdout_results_to_cache(
                 "strategy": strategy,
                 "allocation": allocation,
                 "horizon": horizon,
+                "config": config_name,
                 "model_type": model_type_name,
                 "sharpe": result.sharpe,
                 "ic": result.ic,
@@ -85,13 +89,13 @@ def export_holdout_results_to_cache(
 
 
 def export_walk_forward_results_to_cache(
-    all_wf_results: Dict[Tuple[str, str, int], list],
+    all_wf_results: Dict[Union[Tuple[str, str, int], Tuple[str, str, int, str]], list],
     output_path: Path = None,
 ) -> Path:
     """
     Export walk-forward results to parquet for dashboard.
 
-    :param all_wf_results (Dict): Walk-forward results from ThreeStepEvaluation
+    :param all_wf_results (Dict): Walk-forward results from ThreeStepEvaluation (3-tuple or 4-tuple keys)
     :param output_path (Path): Output path
 
     :return output_path (Path): Path where results were saved
@@ -106,13 +110,15 @@ def export_walk_forward_results_to_cache(
         if not results:
             continue
 
-        strategy, allocation, horizon = key
+        # Handle both 3-tuple (legacy) and 4-tuple keys
+        strategy, allocation, horizon, config_name = _unpack_key(key)
 
         for i, r in enumerate(results):
             data.append({
                 "strategy": strategy,
                 "allocation": allocation,
                 "horizon": horizon,
+                "config": config_name,
                 "window_id": i,
                 "sharpe": r.sharpe,
                 "ic": r.ic,

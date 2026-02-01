@@ -63,9 +63,9 @@ FRED_MD_CATEGORY_MAP: Dict[str, MacroCategory] = {
     "INDPRO": MacroCategory.ECONOMIC_ACTIVITY,
     "IPFPNSS": MacroCategory.ECONOMIC_ACTIVITY,
     "IPFINAL": MacroCategory.ECONOMIC_ACTIVITY,
-    "IPCONGD": MacroCategory.CONSUMPTION,
-    "IPDCONGD": MacroCategory.CONSUMPTION,
-    "IPNCONGD": MacroCategory.CONSUMPTION,
+    "IPCONGD": MacroCategory.ECONOMIC_ACTIVITY,  # Group 1 (Output), not Consumption
+    "IPDCONGD": MacroCategory.ECONOMIC_ACTIVITY,  # Group 1 (Output), not Consumption
+    "IPNCONGD": MacroCategory.ECONOMIC_ACTIVITY,  # Group 1 (Output), not Consumption
     "IPBUSEQ": MacroCategory.ECONOMIC_ACTIVITY,
     "IPMAT": MacroCategory.ECONOMIC_ACTIVITY,
     "IPDMAT": MacroCategory.ECONOMIC_ACTIVITY,
@@ -124,18 +124,20 @@ FRED_MD_CATEGORY_MAP: Dict[str, MacroCategory] = {
     "DPCERA3M086SBEA": MacroCategory.CONSUMPTION,
     "CMRMTSPLx": MacroCategory.CONSUMPTION,
     "RETAILx": MacroCategory.CONSUMPTION,
+    "ACOGNO": MacroCategory.CONSUMPTION,  # New Orders for Consumer Goods
     "AMDMNOx": MacroCategory.ECONOMIC_ACTIVITY,
     "ANDENOx": MacroCategory.ECONOMIC_ACTIVITY,
     "AMDMUOx": MacroCategory.ECONOMIC_ACTIVITY,
     "BUSINVx": MacroCategory.ECONOMIC_ACTIVITY,
     "ISRATIOx": MacroCategory.ECONOMIC_ACTIVITY,
-    "UMCSENTx": MacroCategory.SENTIMENT,
+    "UMCSENTx": MacroCategory.CONSUMPTION,  # Group 4 (Consumption), not Sentiment
 
     # Money and Credit (Group 5)
     "M1SL": MacroCategory.MONETARY_POLICY,
     "M2SL": MacroCategory.MONETARY_POLICY,
     "M2REAL": MacroCategory.MONETARY_POLICY,
     "AMBSL": MacroCategory.MONETARY_POLICY,
+    "BOGMBASE": MacroCategory.MONETARY_POLICY,  # Monetary Base (alternative name)
     "TOTRESNS": MacroCategory.MONETARY_POLICY,
     "NONBORRES": MacroCategory.MONETARY_POLICY,
     "BUSLOANS": MacroCategory.MONETARY_POLICY,
@@ -201,23 +203,44 @@ FRED_MD_CATEGORY_MAP: Dict[str, MacroCategory] = {
 }
 
 # Importance scores for FRED-MD series (1=low, 2=medium, 3=high)
+# Based on market impact research (CME Group, FOREX.com, economic calendars)
 FRED_MD_IMPORTANCE: Dict[str, int] = {
-    # High importance (3)
-    "INDPRO": 3,
-    "UNRATE": 3,
-    "PAYEMS": 3,
-    "CPIAUCSL": 3,
-    "FEDFUNDS": 3,
-    "GS10": 3,
-    "M2SL": 3,
-    "HOUST": 3,
-    "UMCSENTx": 3,
-    "S&P 500": 3,
-    "VXOCLSx": 3,
-    "CLAIMSx": 3,
-    "RETAILx": 3,
+    # ===== HIGH IMPORTANCE (3) - Market Moving =====
+    # Employment (NFP day indicators)
+    "PAYEMS": 3,         # Nonfarm Payrolls - highest impact
+    "UNRATE": 3,         # Unemployment Rate
+    "CLAIMSx": 3,        # Initial Jobless Claims
+    "CES0600000008": 3,  # Avg Hourly Earnings: Goods (wage inflation)
+    "CES2000000008": 3,  # AHE: Construction
+    "CES3000000008": 3,  # AHE: Manufacturing
 
-    # Medium importance (2) - default
+    # Inflation
+    "CPIAUCSL": 3,       # CPI Headline - very high impact
+    "PCEPI": 3,          # PCE Deflator - Fed's preferred measure
+    "OILPRICEx": 3,      # Oil Price - inflation expectations
+
+    # Monetary Policy / Interest Rates
+    "FEDFUNDS": 3,       # Fed Funds Rate - highest impact
+    "GS10": 3,           # 10Y Treasury
+    "GS1": 3,            # 1Y Treasury - policy expectations
+    "T10YFFM": 3,        # 10Y-FF spread - yield curve indicator
+
+    # Economic Activity
+    "INDPRO": 3,         # Industrial Production
+    "RETAILx": 3,        # Retail Sales
+
+    # Sentiment/Risk
+    "VXOCLSx": 3,        # VIX
+    "S&P 500": 3,        # S&P 500
+    "UMCSENTx": 3,       # Consumer Sentiment
+
+    # Housing (leading indicator)
+    "HOUST": 3,          # Housing Starts
+
+    # Money Supply
+    "M2SL": 3,           # M2 Money Stock
+
+    # ===== MEDIUM IMPORTANCE (2) - Default for all others =====
 }
 
 

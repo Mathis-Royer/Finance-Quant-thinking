@@ -9,7 +9,7 @@ Provides plots for analyzing holdout results:
 - Cumulative return curves for holdout period
 """
 
-from typing import Dict, List, Tuple, Any, Optional
+from typing import Dict, List, Tuple, Any, Optional, Union
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -20,12 +20,72 @@ from visualization.colormaps import (
     create_sharpe_colormap,
     COMBINATION_COLORS,
     HORIZON_ALPHAS,
+    CONFIG_COLORS,
+    CONFIG_ORDER,
 )
 from utils.metrics import compute_total_return
+from utils.keys import unpack_key as _unpack_key
 
 
-# Type alias for holdout results
-HoldoutResults = Dict[Tuple[str, str, int], Dict[str, Any]]
+# Type alias for holdout results (supports both 3-tuple and 4-tuple keys)
+HoldoutResults = Dict[
+    Union[Tuple[str, str, int], Tuple[str, str, int, str]],
+    Dict[str, Any]
+]
+
+
+def _filter_results_by_config(
+    results: HoldoutResults,
+    config_filter: Optional[str] = None,
+) -> HoldoutResults:
+    """
+    Filter results to only include specified config.
+
+    :param results (HoldoutResults): Full results dictionary
+    :param config_filter (Optional[str]): Config to filter (None = all)
+
+    :return filtered (HoldoutResults): Filtered results
+    """
+    if config_filter is None:
+        return results
+
+    filtered = {}
+    for key, value in results.items():
+        _, _, _, config = _unpack_key(key)
+        if config == config_filter:
+            filtered[key] = value
+    return filtered
+
+
+def _get_available_combos(
+    filtered_results: HoldoutResults,
+) -> Tuple[List[str], List[str], List[int]]:
+    """
+    Extract strategies, allocations, and horizons that have actual data.
+
+    :param filtered_results (HoldoutResults): Filtered results dictionary
+
+    :return strategies (List[str]): Available strategies in order
+    :return allocations (List[str]): Available allocations in order
+    :return horizons (List[int]): Available horizons sorted
+    """
+    strategies = set()
+    allocations = set()
+    horizons = set()
+
+    for key, results in filtered_results.items():
+        if results is not None:
+            s, a, h, _ = _unpack_key(key)
+            strategies.add(s)
+            allocations.add(a)
+            horizons.add(h)
+
+    # Maintain consistent order
+    strat_order = [s for s in ["E2E", "Sup"] if s in strategies]
+    alloc_order = [a for a in ["Binary", "Multi"] if a in allocations]
+    horiz_order = sorted(horizons)
+
+    return strat_order, alloc_order, horiz_order
 
 
 def plot_final_vs_ensemble_bars(
@@ -33,6 +93,7 @@ def plot_final_vs_ensemble_bars(
     figsize: Tuple[int, int] = (16, 12),
     benchmark_sharpe: Optional[float] = None,
     benchmark_name: str = "Market",
+    config_filter: Optional[str] = "baseline",
 ) -> Figure:
     """
     Plot 2x2 grid of bar charts comparing Final vs Ensemble Sharpe.
@@ -47,21 +108,64 @@ def plot_final_vs_ensemble_bars(
     :param figsize (Tuple[int, int]): Figure size
     :param benchmark_sharpe (float): Optional benchmark Sharpe to show as horizontal line
     :param benchmark_name (str): Name for the benchmark line label
+    :param config_filter (Optional[str]): Config to show (default: "baseline", None = all)
 
     :return fig (Figure): Matplotlib figure
     """
-    fig, axes = plt.subplots(2, 2, figsize=figsize)
+    filtered_results = _filter_results_by_config(all_holdout_results, config_filter)
+
+    config_suffix = f" [{config_filter}]" if config_filter else ""
+
+    # Get available strategies and allocations
+    strategies, allocations, _ = _get_available_combos(filtered_results)
+
+    # Build categories dynamically based on available data
+    categories = []
+    if "Sup" in strategies:
+        categories.append(('Sup', 'Supervised', lambda d: d['strategy'] == 'Sup'))
+    if "E2E" in strategies:
+        categories.append(('E2E', 'End-to-End', lambda d: d['strategy'] == 'E2E'))
+    if "Multi" in allocations:
+        categories.append(('Multi', 'Multi-factor', lambda d: d['allocation'] == 'Multi'))
+    if "Binary" in allocations:
+        categories.append(('Binary', 'Binary', lambda d: d['allocation'] == 'Binary'))
+
+    # Handle case with no data
+    if not categories:
+        fig, ax = plt.subplots(figsize=(8, 4))
+        ax.text(0.5, 0.5, 'No holdout data available', ha='center', va='center', fontsize=12)
+        ax.axis('off')
+        return fig
+
+    # Create adaptive grid based on number of categories
+    n_cats = len(categories)
+    ncols = min(n_cats, 2)
+    nrows = (n_cats + ncols - 1) // ncols
+    # Scale figsize based on grid dimensions
+    base_w, base_h = figsize[0] / 2, figsize[1] / 2
+    actual_figsize = (base_w * ncols, base_h * nrows)
+    fig, axes = plt.subplots(nrows, ncols, figsize=actual_figsize, squeeze=False)
+    axes_flat = axes.flatten()
     fig.suptitle(
-        "Holdout Sharpe: Final vs Ensemble by Category",
+        f"Holdout Sharpe: Final vs Ensemble by Category{config_suffix}",
         fontsize=14,
         fontweight='bold'
     )
 
+    # Hide unused axes (if odd number of categories)
+    for i in range(n_cats, len(axes_flat)):
+        axes_flat[i].axis('off')
+
+    # Check if multiple configs
+    all_configs = set(_unpack_key(k)[3] for k in filtered_results.keys())
+    show_config = config_filter is None and len(all_configs) > 1
+
     # Collect all data
     all_data = []
-    for (s, a, h), results in all_holdout_results.items():
+    for key, results in filtered_results.items():
         if results is None:
             continue
+        s, a, h, cfg = _unpack_key(key)
         final = results.get('final')
         fair_ens = results.get('fair_ensemble')
         wf_ens = results.get('wf_ensemble')
@@ -72,38 +176,26 @@ def plot_final_vs_ensemble_bars(
             'strategy': s,
             'allocation': a,
             'horizon': h,
-            'label': f"{h}M",
+            'config': cfg,
+            'config_label': f"-{cfg}" if show_config else "",
             'final': final_sharpe,
             'fair_ensemble': fair_sharpe,
             'wf_ensemble': wf_sharpe,
             'max_sharpe': max(final_sharpe, fair_sharpe, wf_sharpe),
         })
 
-    # Define the 4 categories
-    categories = [
-        ('Sup', 'Supervised', lambda d: d['strategy'] == 'Sup'),
-        ('E2E', 'End-to-End', lambda d: d['strategy'] == 'E2E'),
-        ('Multi', 'Multi-factor', lambda d: d['allocation'] == 'Multi'),
-        ('Binary', 'Binary', lambda d: d['allocation'] == 'Binary'),
-    ]
-
     for idx, (cat_key, cat_title, filter_fn) in enumerate(categories):
-        ax = axes[idx // 2, idx % 2]
+        ax = axes_flat[idx]
 
         # Filter and sort data for this category
         cat_data = [d for d in all_data if filter_fn(d)]
         cat_data.sort(key=lambda x: x['max_sharpe'], reverse=True)
 
-        if not cat_data:
-            ax.text(0.5, 0.5, 'No data', ha='center', va='center')
-            ax.set_title(cat_title)
-            continue
-
-        # Create labels based on category type
+        # Create labels based on category type (include config if multiple)
         if cat_key in ['Sup', 'E2E']:
-            labels = [f"{d['allocation'][:1]}-{d['horizon']}M" for d in cat_data]
+            labels = [f"{d['allocation'][:1]}-{d['horizon']}M{d['config_label']}" for d in cat_data]
         else:
-            labels = [f"{d['strategy']}-{d['horizon']}M" for d in cat_data]
+            labels = [f"{d['strategy']}-{d['horizon']}M{d['config_label']}" for d in cat_data]
 
         final_sharpes = [d['final'] for d in cat_data]
         fair_sharpes = [d['fair_ensemble'] for d in cat_data]
@@ -160,6 +252,7 @@ def plot_final_vs_ensemble_bars(
 def plot_final_vs_ensemble_scatter(
     all_holdout_results: HoldoutResults,
     figsize: Tuple[int, int] = (10, 8),
+    config_filter: Optional[str] = "baseline",
 ) -> Figure:
     """
     Plot scatter comparing Final vs Ensemble Sharpe.
@@ -168,16 +261,20 @@ def plot_final_vs_ensemble_scatter(
 
     :param all_holdout_results (HoldoutResults): Holdout results dict
     :param figsize (Tuple[int, int]): Figure size
+    :param config_filter (Optional[str]): Config to show (default: "baseline", None = all)
 
     :return fig (Figure): Matplotlib figure
     """
+    filtered_results = _filter_results_by_config(all_holdout_results, config_filter)
+
+    config_suffix = f" [{config_filter}]" if config_filter else ""
     fig, ax = plt.subplots(figsize=figsize)
 
     paired_data = []
-    for key, results in all_holdout_results.items():
+    for key, results in filtered_results.items():
         if results is None:
             continue
-        strategy, allocation, horizon = key
+        strategy, allocation, horizon, config = _unpack_key(key)
         final = results.get('final')
         fair_ens = results.get('fair_ensemble')
 
@@ -222,7 +319,7 @@ def plot_final_vs_ensemble_scatter(
 
     ax.set_xlabel('Final Model Sharpe')
     ax.set_ylabel('Fair Ensemble Sharpe')
-    ax.set_title('Final vs Fair Ensemble: Holdout Sharpe (Fair Comparison)')
+    ax.set_title(f'Final vs Fair Ensemble: Holdout Sharpe (Fair Comparison){config_suffix}')
     ax.legend(loc='lower right')
     ax.grid(True, alpha=0.3)
     ax.set_xlim(lims)
@@ -236,24 +333,37 @@ def plot_sharpe_heatmaps_by_model_type(
     all_holdout_results: HoldoutResults,
     horizons: List[int] = None,
     figsize: Tuple[int, int] = (22, 6),
+    config_filter: Optional[str] = "baseline",
 ) -> Figure:
     """
     Plot three heatmaps: Final, Ensemble, and Delta (Ensemble - Final).
 
-    Rows = Strategy×Allocation, Columns = Horizons.
+    Rows = Strategy×Allocation (×Config if multiple configs), Columns = Horizons.
 
     :param all_holdout_results (HoldoutResults): Holdout results dict
     :param horizons (List[int]): List of horizons (default: [1, 3, 6, 12])
     :param figsize (Tuple[int, int]): Figure size
+    :param config_filter (Optional[str]): Config to show (default: "baseline", None = all)
 
     :return fig (Figure): Matplotlib figure
     """
+    filtered_results = _filter_results_by_config(all_holdout_results, config_filter)
+
     if horizons is None:
-        horizons = sorted(set(key[2] for key in all_holdout_results.keys()))
+        horizons = sorted(set(_unpack_key(key)[2] for key in filtered_results.keys()))
+
+    # Get unique configs in results
+    configs = sorted(
+        set(_unpack_key(key)[3] for key in filtered_results.keys()),
+        key=lambda c: CONFIG_ORDER.index(c) if c in CONFIG_ORDER else 999
+    )
+    show_config = config_filter is None and len(configs) > 1
+
+    config_suffix = f" [{config_filter}]" if config_filter else ""
 
     # Collect all sharpes for consistent colormap
     all_sharpes = []
-    for key, results in all_holdout_results.items():
+    for key, results in filtered_results.items():
         if results is None:
             continue
         if results.get('final'):
@@ -267,40 +377,82 @@ def plot_sharpe_heatmaps_by_model_type(
     global_max = max(all_sharpes) if all_sharpes else 1.0
     cmap, norm = create_sharpe_colormap(global_min, global_max)
 
-    strategies_list = ["E2E", "Sup"]
-    allocations_list = ["Binary", "Multi"]
+    # Get only strategies and allocations that have data
+    strategies_list, allocations_list, available_horizons = _get_available_combos(filtered_results)
+
+    # Use available horizons if not specified
+    if not horizons:
+        horizons = available_horizons
+
+    # Handle case with no data
+    if not strategies_list or not allocations_list:
+        fig, ax = plt.subplots(figsize=(8, 4))
+        ax.text(0.5, 0.5, 'No holdout data available', ha='center', va='center', fontsize=12)
+        ax.axis('off')
+        return fig
 
     heatmap_final = []
     heatmap_fair = []
     heatmap_wf = []
     row_labels = []
 
-    for strategy in strategies_list:
-        for allocation in allocations_list:
-            row_final = []
-            row_fair = []
-            row_wf = []
-            for horizon in horizons:
-                key = (strategy, allocation, horizon)
-                results = all_holdout_results.get(key, {})
-                final_data = results.get('final')
-                fair_data = results.get('fair_ensemble')
-                wf_data = results.get('wf_ensemble')
-                row_final.append(final_data.sharpe if final_data else 0.0)
-                row_fair.append(fair_data.sharpe if fair_data else 0.0)
-                row_wf.append(wf_data.sharpe if wf_data else 0.0)
-            heatmap_final.append(row_final)
-            heatmap_fair.append(row_fair)
-            heatmap_wf.append(row_wf)
-            row_labels.append(f"{strategy}-{allocation}")
+    # When multiple configs, iterate over all configs and add to rows
+    configs_to_iterate = configs if show_config else [configs[0] if configs else "baseline"]
+
+    for config in configs_to_iterate:
+        for strategy in strategies_list:
+            for allocation in allocations_list:
+                row_final = []
+                row_fair = []
+                row_wf = []
+                has_data = False
+                for horizon in horizons:
+                    # Try 4-tuple key first, then 3-tuple for backward compat
+                    key = (strategy, allocation, horizon, config)
+                    results = filtered_results.get(key)
+                    if results is None:
+                        results = filtered_results.get((strategy, allocation, horizon), {})
+                    final_data = results.get('final') if results else None
+                    fair_data = results.get('fair_ensemble') if results else None
+                    wf_data = results.get('wf_ensemble') if results else None
+
+                    if final_data:
+                        has_data = True
+                        row_final.append(final_data.sharpe)
+                    else:
+                        row_final.append(np.nan)
+                    row_fair.append(fair_data.sharpe if fair_data else np.nan)
+                    row_wf.append(wf_data.sharpe if wf_data else np.nan)
+
+                # Only add row if it has data
+                if has_data:
+                    heatmap_final.append(row_final)
+                    heatmap_fair.append(row_fair)
+                    heatmap_wf.append(row_wf)
+                    label = f"{strategy}-{allocation}"
+                    if show_config:
+                        label += f" [{config}]"
+                    row_labels.append(label)
+
+    # Handle case with no data after filtering
+    if not row_labels:
+        fig, ax = plt.subplots(figsize=(8, 4))
+        ax.text(0.5, 0.5, 'No holdout data available', ha='center', va='center', fontsize=12)
+        ax.axis('off')
+        return fig
 
     heatmap_final_arr = np.array(heatmap_final)
     heatmap_fair_arr = np.array(heatmap_fair)
     heatmap_wf_arr = np.array(heatmap_wf)
     heatmap_delta_arr = heatmap_fair_arr - heatmap_final_arr
 
+    # Adjust figsize if multiple configs (more rows)
+    n_rows_data = len(row_labels)
+    adjusted_height = max(4, n_rows_data * 1.2)
+    actual_figsize = (figsize[0], adjusted_height * 2) if show_config else figsize
+
     # 2x2 layout: Final, Fair Ensemble, WF Ensemble, Delta
-    fig, axes = plt.subplots(2, 2, figsize=figsize)
+    fig, axes = plt.subplots(2, 2, figsize=actual_figsize)
     axes = axes.flatten()
 
     # Plot 3 model type heatmaps
@@ -310,20 +462,23 @@ def plot_sharpe_heatmaps_by_model_type(
         ('WF Ensemble', heatmap_wf_arr),
     ]
 
+    label_fontsize = 8 if show_config else 10
     for idx, (model_type, heatmap_arr) in enumerate(heatmaps):
         ax = axes[idx]
         im = ax.imshow(heatmap_arr, cmap=cmap, norm=norm, aspect='auto')
         ax.set_xticks(range(len(horizons)))
         ax.set_xticklabels([f"{h}M" for h in horizons])
         ax.set_yticks(range(len(row_labels)))
-        ax.set_yticklabels(row_labels)
+        ax.set_yticklabels(row_labels, fontsize=label_fontsize)
         ax.set_xlabel("Horizon")
         ax.set_ylabel("Strategy + Allocation")
-        ax.set_title(f"Holdout Sharpe: {model_type}")
+        ax.set_title(f"Holdout Sharpe: {model_type}{config_suffix}")
 
         for i in range(len(row_labels)):
             for j in range(len(horizons)):
                 val = heatmap_arr[i, j]
+                if np.isnan(val):
+                    continue  # Skip NaN values
                 text_color = 'white' if val < 0 or val > 0.8 else 'black'
                 ax.text(
                     j, i, f"{val:.2f}", ha='center', va='center',
@@ -334,7 +489,12 @@ def plot_sharpe_heatmaps_by_model_type(
 
     # Delta heatmap (Fair Ensemble - Final)
     ax_delta = axes[3]
-    delta_max = max(abs(heatmap_delta_arr.min()), abs(heatmap_delta_arr.max()))
+    # Handle NaN in delta calculation
+    valid_deltas = heatmap_delta_arr[~np.isnan(heatmap_delta_arr)]
+    if len(valid_deltas) > 0:
+        delta_max = max(abs(valid_deltas.min()), abs(valid_deltas.max()))
+    else:
+        delta_max = 0.1
     if delta_max == 0:
         delta_max = 0.1
     delta_cmap = plt.cm.RdBu
@@ -352,6 +512,8 @@ def plot_sharpe_heatmaps_by_model_type(
     for i in range(len(row_labels)):
         for j in range(len(horizons)):
             val = heatmap_delta_arr[i, j]
+            if np.isnan(val):
+                continue  # Skip NaN values
             text_color = 'white' if abs(val) > delta_max * 0.6 else 'black'
             ax_delta.text(
                 j, i, f"{val:+.2f}", ha='center', va='center',
@@ -369,6 +531,7 @@ def plot_winner_distribution(
     figsize: Tuple[int, int] = (14, 5),
     benchmark_sharpe: Optional[float] = None,
     benchmark_name: str = "Best Benchmark",
+    config_filter: Optional[str] = "baseline",
 ) -> Figure:
     """
     Plot winner distribution and average Sharpe by model type.
@@ -377,10 +540,15 @@ def plot_winner_distribution(
     :param figsize (Tuple[int, int]): Figure size
     :param benchmark_sharpe (float): Optional benchmark Sharpe to show as horizontal line
     :param benchmark_name (str): Name for the benchmark line label
+    :param config_filter (Optional[str]): Config to show (default: "baseline", None = all)
 
     :return fig (Figure): Matplotlib figure
     """
+    filtered_results = _filter_results_by_config(all_holdout_results, config_filter)
+    config_suffix = f" [{config_filter}]" if config_filter else ""
+
     fig, axes = plt.subplots(1, 2, figsize=figsize)
+    fig.suptitle(f"Winner Distribution{config_suffix}", fontsize=14, fontweight='bold')
 
     final_wins = 0
     ensemble_wins = 0
@@ -390,7 +558,7 @@ def plot_winner_distribution(
     fair_ensemble_sharpes = []
     wf_ensemble_sharpes = []
 
-    for key, results in all_holdout_results.items():
+    for key, results in filtered_results.items():
         if results is None:
             continue
         final = results.get('final')
@@ -414,28 +582,39 @@ def plot_winner_distribution(
 
     # Handle case where no comparisons were made
     total = final_wins + ensemble_wins + ties
-    if total == 0:
-        total = 1  # Avoid division by zero
 
     ax1 = axes[0]
-    ax1.pie(
-        [final_wins, ensemble_wins, ties],
-        labels=['Final Wins', 'Fair Ens. Wins', 'Ties'],
-        autopct='%1.0f%%',
-        colors=['steelblue', 'coral', 'gray'],
-        startangle=90
-    )
-    ax1.set_title('Winner Distribution (Final vs Fair Ensemble)')
+    if total > 0:
+        ax1.pie(
+            [final_wins, ensemble_wins, ties],
+            labels=['Final Wins', 'Fair Ens. Wins', 'Ties'],
+            autopct='%1.0f%%',
+            colors=['steelblue', 'coral', 'gray'],
+            startangle=90
+        )
+        ax1.set_title('Winner Distribution (Final vs Fair Ensemble)')
+    else:
+        ax1.text(
+            0.5, 0.5, 'No Fair Ensemble\n(WF Ensemble only)',
+            ha='center', va='center', fontsize=12, color='gray'
+        )
+        ax1.set_title('Winner Distribution')
+        ax1.axis('off')
 
     ax2 = axes[1]
-    avg_data = {
-        'Final': np.mean(final_sharpes) if final_sharpes else 0,
-        'Fair Ens.': np.mean(fair_ensemble_sharpes) if fair_ensemble_sharpes else 0,
-    }
+    avg_data = {}
+    bar_colors = []
+    if final_sharpes:
+        avg_data['Final'] = np.mean(final_sharpes)
+        bar_colors.append('steelblue')
+    if fair_ensemble_sharpes:
+        avg_data['Fair Ens.'] = np.mean(fair_ensemble_sharpes)
+        bar_colors.append('coral')
     if wf_ensemble_sharpes:
         avg_data['WF Ens.'] = np.mean(wf_ensemble_sharpes)
+        bar_colors.append('green')
 
-    colors = ['steelblue', 'coral', 'green'][:len(avg_data)]
+    colors = bar_colors
     ax2.bar(
         avg_data.keys(), avg_data.values(),
         color=colors, alpha=0.8
@@ -466,6 +645,7 @@ def plot_holdout_cumulative_returns_grid(
     all_holdout_results: HoldoutResults,
     horizons: List[int] = None,
     figsize: Tuple[int, int] = (18, 14),
+    config_filter: Optional[str] = "baseline",
 ) -> Figure:
     """
     Plot 2x2 grid of cumulative returns for holdout period.
@@ -475,36 +655,67 @@ def plot_holdout_cumulative_returns_grid(
     :param all_holdout_results (HoldoutResults): Holdout results dict
     :param horizons (List[int]): List of horizons
     :param figsize (Tuple[int, int]): Figure size
+    :param config_filter (Optional[str]): Config to show (default: "baseline", None = all)
 
     :return fig (Figure): Matplotlib figure
     """
-    if horizons is None:
-        horizons = sorted(set(key[2] for key in all_holdout_results.keys()))
+    filtered_results = _filter_results_by_config(all_holdout_results, config_filter)
+    config_suffix = f" [{config_filter}]" if config_filter else ""
 
-    fig, axes = plt.subplots(2, 2, figsize=figsize)
+    if horizons is None:
+        horizons = sorted(set(_unpack_key(key)[2] for key in filtered_results.keys()))
+
+    # Get available strategies and allocations
+    strategies, allocations, _ = _get_available_combos(filtered_results)
+
+    # Build available groups
+    available_groups = []
+    for s in strategies:
+        for a in allocations:
+            available_groups.append((s, a))
+
+    # Handle case with no data
+    n_groups = len(available_groups)
+    if n_groups == 0:
+        fig, ax = plt.subplots(figsize=(8, 4))
+        ax.text(0.5, 0.5, 'No holdout data available', ha='center', va='center', fontsize=12)
+        ax.axis('off')
+        return fig
+
+    # Create adaptive grid
+    ncols = min(n_groups, 2)
+    nrows = (n_groups + ncols - 1) // ncols
+    base_w, base_h = figsize[0] / 2, figsize[1] / 2
+    actual_figsize = (base_w * ncols, base_h * nrows)
+    fig, axes = plt.subplots(nrows, ncols, figsize=actual_figsize, squeeze=False)
+    axes_flat = axes.flatten()
     fig.suptitle(
-        "Holdout Cumulative Returns: All Models (Final + Ensemble)",
+        f"Holdout Cumulative Returns: All Models (Final + Ensemble){config_suffix}",
         fontsize=14,
         fontweight='bold'
     )
 
+    # Hide unused axes
+    for i in range(n_groups, len(axes_flat)):
+        axes_flat[i].axis('off')
+
     horizon_colors = {1: 'blue', 3: 'green', 6: 'orange', 12: 'red'}
 
-    groups = [
-        ("E2E", "Binary", axes[0, 0]),
-        ("E2E", "Multi", axes[0, 1]),
-        ("Sup", "Binary", axes[1, 0]),
-        ("Sup", "Multi", axes[1, 1]),
-    ]
+    # Build groups with axes
+    groups = [(s, a, axes_flat[i]) for i, (s, a) in enumerate(available_groups)]
+
+    config_to_use = config_filter or "baseline"
 
     for strategy, allocation, ax in groups:
         for horizon in horizons:
-            key = (strategy, allocation, horizon)
+            # Try 4-tuple key first, then 3-tuple for backward compat
+            key = (strategy, allocation, horizon, config_to_use)
+            results = filtered_results.get(key)
+            if results is None:
+                results = filtered_results.get((strategy, allocation, horizon))
 
-            if key not in all_holdout_results or all_holdout_results[key] is None:
+            if results is None:
                 continue
-
-            results = all_holdout_results[key]
             final = results.get('final')
             fair_ens = results.get('fair_ensemble')
             wf_ens = results.get('wf_ensemble')
@@ -549,6 +760,7 @@ def plot_top_models_cumulative(
     all_holdout_results: HoldoutResults,
     top_n: int = 5,
     figsize: Tuple[int, int] = (14, 8),
+    config_filter: Optional[str] = "baseline",
 ) -> Figure:
     """
     Plot cumulative returns for top N models of each type.
@@ -556,12 +768,16 @@ def plot_top_models_cumulative(
     :param all_holdout_results (HoldoutResults): Holdout results dict
     :param top_n (int): Number of top models per type to show
     :param figsize (Tuple[int, int]): Figure size
+    :param config_filter (Optional[str]): Config to show (default: "baseline", None = all)
 
     :return fig (Figure): Matplotlib figure
     """
+    filtered_results = _filter_results_by_config(all_holdout_results, config_filter)
+    config_suffix = f" [{config_filter}]" if config_filter else ""
+
     fig, ax = plt.subplots(figsize=figsize)
     fig.suptitle(
-        f"Holdout Cumulative Returns: Top {top_n} per Type (Final, Fair, WF)",
+        f"Holdout Cumulative Returns: Top {top_n} per Type (Final, Fair, WF){config_suffix}",
         fontsize=14,
         fontweight='bold'
     )
@@ -570,11 +786,13 @@ def plot_top_models_cumulative(
     fair_data = []
     wf_data = []
 
-    for key, results in all_holdout_results.items():
+    for key, results in filtered_results.items():
         if results is None:
             continue
-        strategy, allocation, horizon = key
+        strategy, allocation, horizon, config = _unpack_key(key)
         label = f"{strategy}-{allocation[:1]}-{horizon}M"
+        if config != "baseline":
+            label += f"-{config}"
 
         if results.get('final'):
             final_data.append({
@@ -647,6 +865,7 @@ def plot_top_models_with_benchmarks(
     benchmarks: Optional[Dict[str, Any]] = None,
     top_n: int = 3,
     figsize: Tuple[int, int] = (14, 8),
+    config_filter: Optional[str] = "baseline",
 ) -> Figure:
     """
     Plot cumulative returns for top N models with benchmarks.
@@ -655,22 +874,28 @@ def plot_top_models_with_benchmarks(
     :param benchmarks (Dict[str, BenchmarkResult]): Benchmark results
     :param top_n (int): Number of top models to show
     :param figsize (Tuple[int, int]): Figure size
+    :param config_filter (Optional[str]): Config to show (default: "baseline", None = all)
 
     :return fig (Figure): Matplotlib figure
     """
+    filtered_results = _filter_results_by_config(all_holdout_results, config_filter)
+    config_suffix = f" [{config_filter}]" if config_filter else ""
+
     fig, ax = plt.subplots(figsize=figsize)
     fig.suptitle(
-        f"Holdout Cumulative Returns: Top {top_n} Models vs Benchmarks",
+        f"Holdout Cumulative Returns: Top {top_n} Models vs Benchmarks{config_suffix}",
         fontsize=14,
         fontweight='bold'
     )
 
     all_models = []
-    for key, results in all_holdout_results.items():
+    for key, results in filtered_results.items():
         if results is None:
             continue
-        strategy, allocation, horizon = key
+        strategy, allocation, horizon, config = _unpack_key(key)
         label = f"{strategy}-{allocation[:1]}-{horizon}M"
+        if config != "baseline":
+            label += f"-{config}"
 
         if results.get('final'):
             all_models.append({
@@ -749,22 +974,29 @@ def plot_top_models_with_benchmarks(
 def print_holdout_summary_table(
     all_holdout_results: HoldoutResults,
     compute_score_fn: callable = None,
+    config_filter: Optional[str] = "baseline",
 ) -> pd.DataFrame:
     """
     Print and return holdout results summary table.
 
     :param all_holdout_results (HoldoutResults): Holdout results dict
     :param compute_score_fn (callable): Function to compute composite score
+    :param config_filter (Optional[str]): Config to show (default: "baseline", None = all)
 
     :return df (pd.DataFrame): Summary DataFrame
     """
+    filtered_results = _filter_results_by_config(all_holdout_results, config_filter)
+    config_suffix = f" [{config_filter}]" if config_filter else ""
+
     vis_data = []
-    for key, results in all_holdout_results.items():
+    for key, results in filtered_results.items():
         if results is None:
             continue
 
-        strategy, allocation, horizon = key
+        strategy, allocation, horizon, config = _unpack_key(key)
         label_base = f"{strategy}-{allocation[:1]}-{horizon}M"
+        if config != "baseline":
+            label_base += f"-{config}"
 
         final = results.get('final')
         fair_ens = results.get('fair_ensemble')
@@ -778,6 +1010,7 @@ def print_holdout_summary_table(
                 'strategy': strategy,
                 'allocation': allocation,
                 'horizon': horizon,
+                'config': config,
                 'sharpe': final.sharpe,
                 'total_return': final.total_return,
                 'maxdd': final.maxdd,
@@ -792,6 +1025,7 @@ def print_holdout_summary_table(
                 'strategy': strategy,
                 'allocation': allocation,
                 'horizon': horizon,
+                'config': config,
                 'sharpe': fair_ens.sharpe,
                 'total_return': fair_ens.total_return,
                 'maxdd': fair_ens.maxdd,
@@ -806,6 +1040,7 @@ def print_holdout_summary_table(
                 'strategy': strategy,
                 'allocation': allocation,
                 'horizon': horizon,
+                'config': config,
                 'sharpe': wf_ens.sharpe,
                 'total_return': wf_ens.total_return,
                 'maxdd': wf_ens.maxdd,
@@ -823,23 +1058,41 @@ def print_holdout_summary_table(
         )
         vis_df = vis_df.sort_values('score', ascending=False)
 
-    print("\n" + "=" * 130)
-    print("COMPLETE HOLDOUT RESULTS (with Composite Score)")
-    print("=" * 130)
-    print(f"\n{'Label':<18} {'Strategy':<8} {'Alloc':<7} {'H':<4} {'Type':<10} "
-          f"{'Sharpe':>10} {'IC':>8} {'MaxDD':>10} {'Return':>10} {'Score':>8} {'Rank':>6}")
-    print("-" * 120)
+    # Check if we have multiple configs
+    show_config_col = config_filter is None and len(vis_df) > 0 and vis_df['config'].nunique() > 1
 
-    for _, row in vis_df.iterrows():
-        score = row.get('score', 0)
-        rank = row.get('rank', 0)
-        print(f"{row['label']:<18} {row['strategy']:<8} {row['allocation']:<7} "
-              f"{row['horizon']}M{'':<2} {row['model_type']:<10} "
-              f"{row['sharpe']:>+10.2f} {row['ic']*100:>+8.1f}% "
-              f"{row['maxdd']:>+10.1%} {row['total_return']:>+10.1%} "
-              f"{score:>8.1%} {int(rank):>6}")
+    print("\n" + "=" * 140)
+    print(f"COMPLETE HOLDOUT RESULTS (with Composite Score){config_suffix}")
+    print("=" * 140)
 
-    print("=" * 130)
+    if show_config_col:
+        print(f"\n{'Label':<18} {'Strategy':<8} {'Alloc':<7} {'H':<4} {'Config':<10} {'Type':<10} "
+              f"{'Sharpe':>10} {'IC':>8} {'MaxDD':>10} {'Return':>10} {'Score':>8} {'Rank':>6}")
+        print("-" * 140)
+
+        for _, row in vis_df.iterrows():
+            score = row.get('score', 0)
+            rank = row.get('rank', 0)
+            print(f"{row['label']:<18} {row['strategy']:<8} {row['allocation']:<7} "
+                  f"{row['horizon']}M{'':<2} {row['config']:<10} {row['model_type']:<10} "
+                  f"{row['sharpe']:>+10.2f} {row['ic']*100:>+8.1f}% "
+                  f"{row['maxdd']:>+10.1%} {row['total_return']:>+10.1%} "
+                  f"{score:>8.1%} {int(rank):>6}")
+    else:
+        print(f"\n{'Label':<18} {'Strategy':<8} {'Alloc':<7} {'H':<4} {'Type':<10} "
+              f"{'Sharpe':>10} {'IC':>8} {'MaxDD':>10} {'Return':>10} {'Score':>8} {'Rank':>6}")
+        print("-" * 120)
+
+        for _, row in vis_df.iterrows():
+            score = row.get('score', 0)
+            rank = row.get('rank', 0)
+            print(f"{row['label']:<18} {row['strategy']:<8} {row['allocation']:<7} "
+                  f"{row['horizon']}M{'':<2} {row['model_type']:<10} "
+                  f"{row['sharpe']:>+10.2f} {row['ic']*100:>+8.1f}% "
+                  f"{row['maxdd']:>+10.1%} {row['total_return']:>+10.1%} "
+                  f"{score:>8.1%} {int(rank):>6}")
+
+    print("=" * 140)
 
     return vis_df
 
@@ -850,6 +1103,7 @@ def plot_all_holdout(
     compute_score_fn: callable = None,
     benchmarks: Optional[Dict[str, Any]] = None,
     show: bool = True,
+    config_filter: Optional[str] = "baseline",
 ) -> List[Figure]:
     """
     Create all holdout visualization figures.
@@ -861,9 +1115,12 @@ def plot_all_holdout(
     :param compute_score_fn (callable): Function to compute composite score
     :param benchmarks (Dict[str, BenchmarkResult]): Optional benchmark results
     :param show (bool): Whether to call plt.show() for each figure
+    :param config_filter (Optional[str]): Config to show (default: "baseline", None = all)
 
     :return figures (List[Figure]): List of generated figures
     """
+    filtered_results = _filter_results_by_config(all_holdout_results, config_filter)
+    config_suffix = f" [{config_filter}]" if config_filter else ""
     figures = []
 
     # Find the best benchmark by Sharpe ratio
@@ -880,58 +1137,63 @@ def plot_all_holdout(
             benchmark_name = best_bm[1].name
 
     fig1 = plot_final_vs_ensemble_bars(
-        all_holdout_results,
+        filtered_results,
         benchmark_sharpe=benchmark_sharpe,
         benchmark_name=benchmark_name,
+        config_filter=config_filter,
     )
     figures.append(fig1)
     if show:
         plt.show()
 
-    fig2 = plot_final_vs_ensemble_scatter(all_holdout_results)
+    fig2 = plot_final_vs_ensemble_scatter(filtered_results, config_filter=config_filter)
     figures.append(fig2)
     if show:
         plt.show()
 
-    fig3 = plot_sharpe_heatmaps_by_model_type(all_holdout_results, horizons)
+    fig3 = plot_sharpe_heatmaps_by_model_type(filtered_results, horizons, config_filter=config_filter)
     figures.append(fig3)
     if show:
         plt.show()
 
     fig4 = plot_winner_distribution(
-        all_holdout_results,
+        filtered_results,
         benchmark_sharpe=benchmark_sharpe,
         benchmark_name=benchmark_name,
+        config_filter=config_filter,
     )
     figures.append(fig4)
     if show:
         plt.show()
 
     fig5 = plot_top_models_with_benchmarks(
-        all_holdout_results,
+        filtered_results,
         benchmarks=benchmarks,
         top_n=3,
+        config_filter=config_filter,
     )
     figures.append(fig5)
     if show:
         plt.show()
 
-    print_holdout_summary_table(all_holdout_results, compute_score_fn)
+    print_holdout_summary_table(filtered_results, compute_score_fn, config_filter=config_filter)
 
     # Build comparison table: Top 3 models + Benchmarks
     print("\n" + "=" * 100)
-    print("TOP 3 MODELS vs BENCHMARKS (Holdout Period)")
+    print(f"TOP 3 MODELS vs BENCHMARKS (Holdout Period){config_suffix}")
     print("=" * 100)
     print(f"{'Name':<25} {'Sharpe':>10} {'IC':>10} {'MaxDD':>10} {'Return':>12} {'Score':>10}")
     print("-" * 100)
 
     # Get top 3 models (all types)
     all_models = []
-    for key, results in all_holdout_results.items():
+    for key, results in filtered_results.items():
         if results is None:
             continue
-        strategy, allocation, horizon = key
+        strategy, allocation, horizon, config = _unpack_key(key)
         label = f"{strategy}-{allocation[:1]}-{horizon}M"
+        if config != "baseline":
+            label += f"-{config}"
         if results.get('final'):
             final = results['final']
             all_models.append({
@@ -989,3 +1251,144 @@ def plot_all_holdout(
     print("=" * 100)
 
     return figures
+
+
+def plot_config_comparison(
+    all_holdout_results: HoldoutResults,
+    metric: str = "sharpe",
+    model_type: str = "final",
+    compute_score_fn: Optional[callable] = None,
+) -> Figure:
+    """
+    Bar chart comparing configs (baseline vs fs vs hpt vs fs+hpt).
+
+    Groups by config, shows avg metric across all 16 base combinations.
+
+    :param all_holdout_results (HoldoutResults): All holdout results (4-tuple keys)
+    :param metric (str): Metric to compare ("sharpe", "ic", "maxdd", "score")
+    :param model_type (str): Model type to use ("final", "fair_ensemble", "wf_ensemble")
+    :param compute_score_fn (callable): Function to compute composite score
+
+    :return fig (Figure): Matplotlib figure
+    """
+    # Collect data by config
+    config_data: Dict[str, List[float]] = {}
+
+    for key, results in all_holdout_results.items():
+        if results is None:
+            continue
+        _, _, _, config = _unpack_key(key)
+
+        result = results.get(model_type)
+        if result is None:
+            continue
+
+        if config not in config_data:
+            config_data[config] = []
+
+        if metric == "sharpe":
+            config_data[config].append(result.sharpe)
+        elif metric == "ic":
+            config_data[config].append(result.ic)
+        elif metric == "maxdd":
+            config_data[config].append(result.maxdd)
+        elif metric == "score" and compute_score_fn is not None:
+            # Compute score for this result
+            df_temp = pd.DataFrame([{
+                "sharpe": result.sharpe,
+                "ic": result.ic,
+                "maxdd": result.maxdd,
+                "total_return": result.total_return,
+            }])
+            df_with_score = compute_score_fn(df_temp, total_return_col="total_return")
+            config_data[config].append(df_with_score["score"].iloc[0])
+        else:
+            config_data[config].append(result.sharpe)
+
+    if not config_data:
+        print("No data to plot for config comparison")
+        return None
+
+    # Calculate averages
+    configs = list(config_data.keys())
+    avgs = [np.mean(config_data[c]) for c in configs]
+    stds = [np.std(config_data[c]) for c in configs]
+
+    # Sort by average value (descending for sharpe/ic/score, ascending for maxdd)
+    if metric == "maxdd":
+        sorted_idx = np.argsort(avgs)  # Less negative = better
+    else:
+        sorted_idx = np.argsort(avgs)[::-1]  # Higher = better
+
+    configs = [configs[i] for i in sorted_idx]
+    avgs = [avgs[i] for i in sorted_idx]
+    stds = [stds[i] for i in sorted_idx]
+
+    # Create figure
+    fig, ax = plt.subplots(figsize=(10, 6))
+
+    # Color mapping for configs
+    config_colors = {
+        "baseline": "#4285F4",  # Google Blue
+        "fs": "#34A853",        # Google Green
+        "hpt": "#FBBC04",       # Google Yellow
+        "fs+hpt": "#EA4335",    # Google Red
+    }
+    colors = [config_colors.get(c, "#666666") for c in configs]
+
+    # Bar chart
+    x = np.arange(len(configs))
+    bars = ax.bar(x, avgs, yerr=stds, capsize=5, color=colors, alpha=0.8, edgecolor="black")
+
+    # Add value labels on bars
+    for bar, avg, std in zip(bars, avgs, stds):
+        height = bar.get_height()
+        if metric in ["ic", "maxdd"]:
+            label = f"{avg*100:+.1f}%"
+        elif metric == "score":
+            label = f"{avg:.1%}"
+        else:
+            label = f"{avg:+.2f}"
+        ax.annotate(
+            label,
+            xy=(bar.get_x() + bar.get_width() / 2, height),
+            xytext=(0, 3),
+            textcoords="offset points",
+            ha="center",
+            va="bottom",
+            fontsize=11,
+            fontweight="bold",
+        )
+
+    # Formatting
+    ax.set_xticks(x)
+    ax.set_xticklabels(configs, fontsize=12)
+    ax.set_ylabel(metric.upper(), fontsize=12)
+
+    metric_labels = {
+        "sharpe": "Sharpe Ratio",
+        "ic": "Information Coefficient",
+        "maxdd": "Max Drawdown",
+        "score": "Composite Score",
+    }
+    model_labels = {
+        "final": "Final Model",
+        "fair_ensemble": "Fair Ensemble",
+        "wf_ensemble": "WF Ensemble",
+    }
+    ax.set_title(
+        f"Config Comparison: {metric_labels.get(metric, metric)} ({model_labels.get(model_type, model_type)})",
+        fontsize=14,
+        fontweight="bold",
+    )
+
+    # Add baseline reference line
+    if "baseline" in config_data:
+        baseline_avg = np.mean(config_data["baseline"])
+        ax.axhline(baseline_avg, color="gray", linestyle="--", alpha=0.7, label="Baseline avg")
+        ax.legend(loc="best")
+
+    ax.grid(axis="y", alpha=0.3)
+    plt.tight_layout()
+
+    return fig

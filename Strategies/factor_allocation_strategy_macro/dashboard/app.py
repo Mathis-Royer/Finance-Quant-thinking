@@ -18,6 +18,16 @@ import numpy as np
 import matplotlib.pyplot as plt
 from typing import Dict, List, Any, Optional, Tuple
 
+# Import shared utilities from src
+from comparison_runner import compute_composite_score as _compute_composite_score
+from utils.constants import (
+    MODEL_TYPE_ABBREV,
+    CONFIG_SUFFIX,
+    STRATEGY_ABBREV,
+    ALLOCATION_ABBREV,
+)
+from visualization.colormaps import CONFIG_COLORS
+
 # Page configuration
 st.set_page_config(
     page_title="Factor Allocation Dashboard",
@@ -83,6 +93,7 @@ def create_sample_data() -> pd.DataFrame:
     strategies = ["Sup", "E2E"]
     allocations = ["Multi", "Binary"]
     horizons = [1, 3, 6, 12]
+    configs = ["baseline"]  # Sample data only uses baseline
     model_types = ["Final", "Fair Ensemble", "WF Ensemble"]
 
     np.random.seed(42)
@@ -90,21 +101,23 @@ def create_sample_data() -> pd.DataFrame:
     for strategy in strategies:
         for allocation in allocations:
             for horizon in horizons:
-                for model_type in model_types:
-                    base_sharpe = 0.5 if allocation == "Multi" else 0.2
-                    base_sharpe += 0.1 if strategy == "Sup" else 0
-                    base_sharpe += np.random.uniform(-0.3, 0.3)
+                for config in configs:
+                    for model_type in model_types:
+                        base_sharpe = 0.5 if allocation == "Multi" else 0.2
+                        base_sharpe += 0.1 if strategy == "Sup" else 0
+                        base_sharpe += np.random.uniform(-0.3, 0.3)
 
-                    data.append({
-                        "strategy": strategy,
-                        "allocation": allocation,
-                        "horizon": horizon,
-                        "model_type": model_type,
-                        "sharpe": base_sharpe,
-                        "ic": np.random.uniform(-0.3, 0.3),
-                        "maxdd": np.random.uniform(-0.15, -0.02),
-                        "total_return": np.random.uniform(-0.05, 0.10),
-                    })
+                        data.append({
+                            "strategy": strategy,
+                            "allocation": allocation,
+                            "horizon": horizon,
+                            "config": config,
+                            "model_type": model_type,
+                            "sharpe": base_sharpe,
+                            "ic": np.random.uniform(-0.3, 0.3),
+                            "maxdd": np.random.uniform(-0.15, -0.02),
+                            "total_return": np.random.uniform(-0.05, 0.10),
+                        })
 
     df = pd.DataFrame(data)
     df = compute_score(df)
@@ -120,9 +133,7 @@ def compute_score(
     reject_negative_ic_threshold: float = -0.3,
 ) -> pd.DataFrame:
     """
-    Compute composite score with asymmetric IC penalty and exponential MaxDD.
-
-    Matches the formula in comparison_runner.compute_composite_score().
+    Compute composite score. Wrapper around comparison_runner.compute_composite_score().
 
     :param df (pd.DataFrame): DataFrame with sharpe, ic, maxdd, total_return columns
     :param sharpe_weight (float): Weight for Sharpe ratio in score
@@ -133,52 +144,21 @@ def compute_score(
 
     :return df (pd.DataFrame): DataFrame with score and rank columns added
     """
-    import numpy as np
-    df = df.copy()
-
-    # Fixed bounds for Sharpe normalization
-    sharpe_min, sharpe_max = -0.5, 1.5
-
-    def compute_score_row(row):
-        sharpe = row["sharpe"]
-        ic = row["ic"]
-        maxdd = row["maxdd"]
-        total_return = row.get("total_return", 0)
-
-        # 1. Reject if IC very negative (inverted predictions)
-        if ic < reject_negative_ic_threshold:
-            return 0.0
-
-        # 2. Sharpe normalization [0, 1]
-        sharpe_norm = np.clip((sharpe - sharpe_min) / (sharpe_max - sharpe_min), 0, 1)
-
-        # 3. IC with asymmetric penalty (saturates at 100%, not 50%)
-        if ic >= 0:
-            ic_score = np.clip(ic, 0, 1)  # Positive IC: [0, 1.0] -> [0, 1]
-            ic_penalty = 0.0
-        else:
-            ic_score = 0.0  # Negative IC contributes nothing positive
-            ic_penalty = 2 * np.clip(-ic, 0, 1)  # Double penalty
-
-        # 4. MaxDD with exponential penalty
-        # -5% -> 0.86, -10% -> 0.74, -15% -> 0.64, -20% -> 0.55
-        maxdd_score = np.exp(3 * maxdd)  # maxdd is negative
-
-        # 5. Final score
-        score = (
-            sharpe_weight * sharpe_norm
-            + ic_weight * ic_score
-            + maxdd_weight * maxdd_score
-            + return_weight * (1 if total_return > 0 else 0)
-            - 0.15 * ic_penalty  # Explicit penalty for negative IC
-        )
-
-        return np.clip(score, 0, 1)
-
-    df["score"] = df.apply(compute_score_row, axis=1)
-    df["rank"] = df["score"].rank(ascending=False).astype(int)
-
-    return df
+    weights = {
+        "sharpe": sharpe_weight,
+        "ic": ic_weight,
+        "maxdd": maxdd_weight,
+        "return": return_weight,
+    }
+    return _compute_composite_score(
+        df,
+        sharpe_col="sharpe",
+        ic_col="ic",
+        maxdd_col="maxdd",
+        total_return_col="total_return" if "total_return" in df.columns else None,
+        weights=weights,
+        reject_negative_ic_threshold=reject_negative_ic_threshold,
+    )
 
 
 @st.cache_data
@@ -238,6 +218,17 @@ def render_sidebar_filters(df: pd.DataFrame) -> Dict[str, List]:
     # Convert back to int
     selected_horizons_int = [int(h.replace("M", "")) for h in selected_horizons]
 
+    # Config filter (FS/HPT axis) - only show if column exists
+    selected_configs = ["baseline"]  # Default for backward compatibility
+    if "config" in df.columns:
+        all_configs = sorted(df["config"].unique().tolist())
+        selected_configs = st.sidebar.multiselect(
+            "Config",
+            options=all_configs,
+            default=all_configs,
+            help="baseline=default, fs=feature selection, hpt=HP tuning, fs+hpt=both"
+        )
+
     # Model Type filter
     all_types = sorted(df["model_type"].unique().tolist())
     selected_types = st.sidebar.multiselect(
@@ -274,6 +265,7 @@ def render_sidebar_filters(df: pd.DataFrame) -> Dict[str, List]:
         "strategies": selected_strategies,
         "allocations": selected_allocations,
         "horizons": selected_horizons_int,
+        "configs": selected_configs,
         "model_types": selected_types,
         "sharpe_weight": sharpe_weight,
         "ic_weight": ic_weight,
@@ -290,6 +282,11 @@ def apply_filters(df: pd.DataFrame, filters: Dict) -> pd.DataFrame:
         df["horizon"].isin(filters["horizons"]) &
         df["model_type"].isin(filters["model_types"])
     )
+
+    # Filter by config if column exists (backward compatible)
+    if "config" in df.columns and "configs" in filters:
+        mask = mask & df["config"].isin(filters["configs"])
+
     filtered_df = df[mask].copy()
 
     # Recompute scores with new weights
@@ -318,10 +315,16 @@ def render_results_table(df: pd.DataFrame, show_averages: bool = True):
     # Sort by score
     display_df = df.sort_values("score", ascending=False).copy()
 
-    # Create label column
-    type_abbrev = {"Final": "F", "Fair Ensemble": "FE", "WF Ensemble": "WF"}
+    # Create label column (include config if multiple configs exist)
+    type_abbrev = MODEL_TYPE_ABBREV
+    config_abbrev = CONFIG_SUFFIX
+    has_multi_configs = "config" in display_df.columns and display_df["config"].nunique() > 1
     display_df["label"] = display_df.apply(
-        lambda row: f"{row['strategy']}-{row['allocation'][0]}-{row['horizon']}M-{type_abbrev.get(row['model_type'], row['model_type'][:2])}",
+        lambda row: (
+            f"{row['strategy']}-{row['allocation'][0]}-{row['horizon']}M"
+            f"{config_abbrev.get(row.get('config', 'baseline'), '') if has_multi_configs else ''}"
+            f"-{type_abbrev.get(row['model_type'], row['model_type'][:2])}"
+        ),
         axis=1
     )
 
@@ -379,18 +382,25 @@ def render_results_table(df: pd.DataFrame, show_averages: bool = True):
     )
 
 
-def render_pivot_table(df: pd.DataFrame, metric: str = "sharpe"):
-    """Render pivot table with averages."""
+def render_pivot_table(df: pd.DataFrame, metric: str = "sharpe", group_by: str = "horizon"):
+    """
+    Render pivot table with averages.
+
+    :param df (pd.DataFrame): DataFrame with results
+    :param metric (str): Metric to display (sharpe, ic, maxdd, total_return)
+    :param group_by (str): Column to use for pivot columns (horizon or config)
+    """
     if len(df) == 0:
         return
 
-    st.markdown(f"### Pivot Table: {metric.upper()} by Strategy/Allocation x Horizon")
+    group_label = "Horizon" if group_by == "horizon" else "Config"
+    st.markdown(f"### Pivot Table: {metric.upper()} by Strategy/Allocation x {group_label}")
 
     # Create pivot
     pivot = df.pivot_table(
         values=metric,
         index=["strategy", "allocation"],
-        columns="horizon",
+        columns=group_by,
         aggfunc="mean",
     )
 
@@ -425,15 +435,24 @@ def render_sharpe_bar_chart(df: pd.DataFrame, benchmarks_df: pd.DataFrame = None
     if len(df) == 0:
         return
 
-    fig, ax = plt.subplots(figsize=(14, 6))
+    # Dynamic height based on number of models (min 8, max 30, scale by number of rows)
+    n_rows = len(df)
+    fig_height = max(8, min(30, n_rows * 0.5 + 4))
+    fig, ax = plt.subplots(figsize=(14, fig_height))
 
     # Sort by sharpe
     sorted_df = df.sort_values("sharpe", ascending=True)
 
-    # Create labels
-    type_abbrev = {"Final": "F", "Fair Ensemble": "FE", "WF Ensemble": "WF"}
+    # Create labels (include config if multiple configs exist)
+    type_abbrev = MODEL_TYPE_ABBREV
+    config_abbrev = CONFIG_SUFFIX
+    has_multi_configs = "config" in sorted_df.columns and sorted_df["config"].nunique() > 1
     labels = sorted_df.apply(
-        lambda row: f"{row['strategy']}-{row['allocation'][0]}-{row['horizon']}M-{type_abbrev.get(row['model_type'], '?')}",
+        lambda row: (
+            f"{row['strategy']}-{row['allocation'][0]}-{row['horizon']}M"
+            f"{config_abbrev.get(row.get('config', 'baseline'), '') if has_multi_configs else ''}"
+            f"-{type_abbrev.get(row['model_type'], '?')}"
+        ),
         axis=1
     )
 
@@ -606,9 +625,13 @@ def render_scatter_final_vs_ensemble(df: pd.DataFrame):
         st.info("Need both Final and Fair Ensemble models for this comparison.")
         return
 
-    # Merge on key
-    final_df["key"] = final_df["strategy"] + "-" + final_df["allocation"] + "-" + final_df["horizon"].astype(str)
-    fair_df["key"] = fair_df["strategy"] + "-" + fair_df["allocation"] + "-" + fair_df["horizon"].astype(str)
+    # Merge on key (include config if exists)
+    if "config" in final_df.columns:
+        final_df["key"] = final_df["strategy"] + "-" + final_df["allocation"] + "-" + final_df["horizon"].astype(str) + "-" + final_df["config"]
+        fair_df["key"] = fair_df["strategy"] + "-" + fair_df["allocation"] + "-" + fair_df["horizon"].astype(str) + "-" + fair_df["config"]
+    else:
+        final_df["key"] = final_df["strategy"] + "-" + final_df["allocation"] + "-" + final_df["horizon"].astype(str)
+        fair_df["key"] = fair_df["strategy"] + "-" + fair_df["allocation"] + "-" + fair_df["horizon"].astype(str)
 
     merged = final_df.merge(fair_df, on="key", suffixes=("_final", "_fair"))
 
@@ -690,7 +713,9 @@ def render_cumulative_returns(df: pd.DataFrame, benchmarks_df: pd.DataFrame = No
     # Model colors (solid lines)
     model_colors = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd"]
 
-    type_abbrev = {"Final": "F", "Fair Ensemble": "FE", "WF Ensemble": "WF"}
+    type_abbrev = MODEL_TYPE_ABBREV
+    config_abbrev = CONFIG_SUFFIX
+    has_multi_configs = "config" in top_models.columns and top_models["config"].nunique() > 1
 
     n_months = None
     for i, (_, row) in enumerate(top_models.iterrows()):
@@ -713,7 +738,8 @@ def render_cumulative_returns(df: pd.DataFrame, benchmarks_df: pd.DataFrame = No
         # Compute cumulative returns
         cum_ret = np.cumprod(1 + np.array(returns))
 
-        label = f"{row['strategy']}-{row['allocation'][0]}-{row['horizon']}M-{type_abbrev.get(row['model_type'], '?')}"
+        config_suffix = config_abbrev.get(row.get('config', 'baseline'), '') if has_multi_configs else ''
+        label = f"{row['strategy']}-{row['allocation'][0]}-{row['horizon']}M{config_suffix}-{type_abbrev.get(row['model_type'], '?')}"
         ax.plot(
             range(len(cum_ret)), cum_ret,
             linewidth=2.5, linestyle="-", color=model_colors[i % len(model_colors)],
@@ -769,6 +795,109 @@ def render_cumulative_returns(df: pd.DataFrame, benchmarks_df: pd.DataFrame = No
     plt.close()
 
 
+def render_config_comparison(df: pd.DataFrame):
+    """
+    Render bar chart comparing configs (baseline vs fs vs hpt vs fs+hpt).
+
+    Matches the style of render_model_type_comparison() with 3 columns:
+    Sharpe, IC, MaxDD.
+
+    :param df (pd.DataFrame): DataFrame with config column
+    """
+    if "config" not in df.columns or df["config"].nunique() <= 1:
+        return
+
+    # Group by config
+    config_stats = df.groupby("config").agg({
+        "sharpe": "mean",
+        "ic": "mean",
+        "maxdd": "mean",
+    }).reset_index()
+
+    # Sort configs in logical order
+    config_order = ["baseline", "fs", "hpt", "fs+hpt"]
+    config_stats["order"] = config_stats["config"].apply(
+        lambda x: config_order.index(x) if x in config_order else 99
+    )
+    config_stats = config_stats.sort_values("order")
+
+    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+
+    metrics = ["sharpe", "ic", "maxdd"]
+    titles = ["Sharpe Ratio", "Information Coefficient", "Max Drawdown"]
+
+    # Config colors
+    config_colors = CONFIG_COLORS
+    colors = [config_colors.get(c, "#666666") for c in config_stats["config"]]
+
+    # Get baseline values for reference lines
+    baseline_values = {}
+    baseline_row = config_stats[config_stats["config"] == "baseline"]
+    if len(baseline_row) > 0:
+        baseline_values["sharpe"] = baseline_row["sharpe"].values[0]
+        baseline_values["ic"] = baseline_row["ic"].values[0]
+        baseline_values["maxdd"] = baseline_row["maxdd"].values[0]
+
+    for ax, metric, title in zip(axes, metrics, titles):
+        # Sharpe is a ratio, IC and MaxDD are percentages
+        if metric == "sharpe":
+            plot_values = config_stats[metric].values
+            ylabel = title
+        elif metric == "ic":
+            plot_values = config_stats[metric].values * 100
+            ylabel = f"{title} (%)"
+        else:
+            plot_values = config_stats[metric].values * 100
+            ylabel = f"{title} (%)"
+
+        bars = ax.bar(config_stats["config"], plot_values, color=colors, alpha=0.8, edgecolor="black")
+        ax.axhline(y=0, color="black", linewidth=0.5)
+        ax.set_ylabel(ylabel)
+        ax.set_title(f"Average {title} by Config", fontweight="bold")
+        ax.grid(True, alpha=0.3, axis="y")
+
+        if metric == "sharpe":
+            ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: f"{x:.2f}"))
+        else:
+            ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: f"{x:.0f}%"))
+
+        # Add baseline reference line
+        if metric in baseline_values:
+            if metric == "sharpe":
+                bm_val = baseline_values[metric]
+                ax.axhline(
+                    y=bm_val, color="gray", linewidth=2, linestyle="--",
+                    label=f"Baseline: {bm_val:.2f}"
+                )
+            else:
+                bm_val = baseline_values[metric] * 100
+                ax.axhline(
+                    y=bm_val, color="gray", linewidth=2, linestyle="--",
+                    label=f"Baseline: {bm_val:.0f}%"
+                )
+            ax.legend(loc="upper right", fontsize=8)
+
+        # Add value labels
+        for bar in bars:
+            height = bar.get_height()
+            if metric == "sharpe":
+                label = f"{height:.2f}"
+            else:
+                label = f"{height:.0f}%"
+            ax.annotate(
+                label,
+                xy=(bar.get_x() + bar.get_width() / 2, height),
+                xytext=(0, 3),
+                textcoords="offset points",
+                ha="center",
+                fontsize=9,
+            )
+
+    plt.tight_layout()
+    st.pyplot(fig)
+    plt.close()
+
+
 def render_benchmarks_comparison(df: pd.DataFrame, benchmarks_df: pd.DataFrame):
     """Render comparison with benchmarks."""
     if len(df) == 0:
@@ -789,11 +918,20 @@ def render_benchmarks_comparison(df: pd.DataFrame, benchmarks_df: pd.DataFrame):
     metric_col = metric_options[selected_metric_label]
 
     # Get top 3 models by SCORE (always the same regardless of displayed metric)
-    top_models = df.nlargest(3, "score")[["strategy", "allocation", "horizon", "model_type", "sharpe", "maxdd", "total_return", "score"]].copy()
+    cols_to_select = ["strategy", "allocation", "horizon", "model_type", "sharpe", "maxdd", "total_return", "score"]
+    if "config" in df.columns:
+        cols_to_select.append("config")
+    top_models = df.nlargest(3, "score")[cols_to_select].copy()
 
-    type_abbrev = {"Final": "F", "Fair Ensemble": "FE", "WF Ensemble": "WF"}
+    type_abbrev = MODEL_TYPE_ABBREV
+    config_abbrev = CONFIG_SUFFIX
+    has_multi_configs = "config" in top_models.columns and top_models["config"].nunique() > 1
     top_models["name"] = top_models.apply(
-        lambda row: f"{row['strategy']}-{row['allocation'][0]}-{row['horizon']}M-{type_abbrev.get(row['model_type'], '?')}",
+        lambda row: (
+            f"{row['strategy']}-{row['allocation'][0]}-{row['horizon']}M"
+            f"{config_abbrev.get(row.get('config', 'baseline'), '') if has_multi_configs else ''}"
+            f"-{type_abbrev.get(row['model_type'], '?')}"
+        ),
         axis=1
     )
 
@@ -917,6 +1055,12 @@ def main():
         st.markdown("#### Model Type Comparison")
         render_model_type_comparison(filtered_df, benchmarks_df)
 
+        # Config comparison (only show if multiple configs)
+        if "config" in filtered_df.columns and filtered_df["config"].nunique() > 1:
+            st.markdown("---")
+            st.markdown("#### Config Comparison (FS/HPT)")
+            render_config_comparison(filtered_df)
+
         st.markdown("---")
 
         st.markdown("#### Cumulative Returns (Top 3 Models vs Benchmarks)")
@@ -930,12 +1074,31 @@ def main():
     with tab3:
         st.markdown("### Pivot Analysis")
 
-        metric_choice = st.selectbox(
-            "Select Metric",
-            options=["sharpe", "ic", "maxdd", "total_return"],
-            format_func=lambda x: {"sharpe": "Sharpe Ratio", "ic": "Information Coefficient", "maxdd": "Max Drawdown", "total_return": "Total Return"}[x]
-        )
-        render_pivot_table(filtered_df, metric=metric_choice)
+        # Metric and group by selection
+        col_metric, col_group = st.columns(2)
+
+        with col_metric:
+            metric_choice = st.selectbox(
+                "Select Metric",
+                options=["sharpe", "ic", "maxdd", "total_return"],
+                format_func=lambda x: {"sharpe": "Sharpe Ratio", "ic": "Information Coefficient", "maxdd": "Max Drawdown", "total_return": "Total Return"}[x]
+            )
+
+        with col_group:
+            # Only show config option if multiple configs exist
+            group_options = ["horizon"]
+            group_labels = {"horizon": "by Horizon"}
+            if "config" in filtered_df.columns and filtered_df["config"].nunique() > 1:
+                group_options.append("config")
+                group_labels["config"] = "by Config (FS/HPT)"
+
+            group_by_choice = st.selectbox(
+                "Group By",
+                options=group_options,
+                format_func=lambda x: group_labels[x]
+            )
+
+        render_pivot_table(filtered_df, metric=metric_choice, group_by=group_by_choice)
 
     with tab4:
         st.markdown("### Comparison with Benchmarks")

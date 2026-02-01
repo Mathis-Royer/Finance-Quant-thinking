@@ -139,3 +139,14 @@ HORIZON_ALPHAS = {
     6: 0.8,
     12: 1.0,
 }
+
+# Color scheme for configs (FS/HPT analysis)
+CONFIG_COLORS = {
+    "baseline": "#4285F4",  # Blue (Google)
+    "fs": "#34A853",        # Green
+    "hpt": "#FBBC04",       # Yellow/Orange
+    "fs+hpt": "#EA4335",    # Red
+}
+
+# Ordered list of configs for consistent plotting
+CONFIG_ORDER = ["baseline", "fs", "hpt", "fs+hpt"]

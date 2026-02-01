@@ -14,6 +14,8 @@ from visualization.colormaps import (
     HORIZON_COLORS,
     HORIZON_LINESTYLES,
     HORIZON_ALPHAS,
+    CONFIG_COLORS,
+    CONFIG_ORDER,
 )
 
 from visualization.walk_forward_plots import (
@@ -36,6 +38,7 @@ from visualization.holdout_plots import (
     plot_top_models_with_benchmarks,
     print_holdout_summary_table,
     plot_all_holdout,
+    plot_config_comparison,
 )
 
 __all__ = [
@@ -46,6 +49,8 @@ __all__ = [
     "HORIZON_COLORS",
     "HORIZON_LINESTYLES",
     "HORIZON_ALPHAS",
+    "CONFIG_COLORS",
+    "CONFIG_ORDER",
     # Walk-forward plots
     "plot_sharpe_heatmaps",
     "plot_return_heatmaps",
@@ -64,4 +69,5 @@ __all__ = [
     "plot_top_models_with_benchmarks",
     "print_holdout_summary_table",
     "plot_all_holdout",
+    "plot_config_comparison",
 ]

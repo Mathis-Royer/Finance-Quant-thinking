@@ -7,8 +7,8 @@ Trains and evaluates all 16 combinations:
 - 4 horizons (1M, 3M, 6M, 12M)
 """
 
-from typing import Dict, List, Tuple
-from dataclasses import dataclass
+from typing import Dict, List, Tuple, Any, Optional
+from dataclasses import dataclass, field
 import numpy as np
 import pandas as pd
 import torch
@@ -39,6 +39,49 @@ class ComparisonConfig:
     def __post_init__(self):
         if self.horizons is None:
             self.horizons = HORIZONS
+
+
+@dataclass
+class CombinationConfig:
+    """
+    Configuration for a single combination run with FS/HPT settings.
+
+    Used to track which feature selection and HP tuning settings are active
+    for a given run of the 16 base combinations.
+    """
+    use_feature_selection: bool = False
+    use_hp_tuning: bool = False
+    n_features: int = 30
+    selection_method: str = "mutual_info"
+    hp_tuning_params: Optional[Dict[str, Any]] = None
+    selector: Optional[Any] = None  # IndicatorSelector if FS enabled
+
+    @property
+    def config_name(self) -> str:
+        """
+        Return config name based on active settings.
+
+        :return name (str): 'baseline', 'fs', 'hpt', or 'fs+hpt'
+        """
+        if self.use_feature_selection and self.use_hp_tuning:
+            return "fs+hpt"
+        elif self.use_feature_selection:
+            return "fs"
+        elif self.use_hp_tuning:
+            return "hpt"
+        return "baseline"
+
+    def get_effective_config(self, base_config: Dict) -> Dict:
+        """
+        Merge base config with tuned params if HP tuning is enabled.
+
+        :param base_config (Dict): Base model configuration
+
+        :return config (Dict): Effective configuration with tuned params applied
+        """
+        if self.hp_tuning_params:
+            return {**base_config, **self.hp_tuning_params}
+        return base_config
 
 
 def set_seed(seed: int = 42) -> None:
@@ -1185,6 +1228,7 @@ def run_combination_walk_forward(
     verbose: bool = True,
     holdout_years: int = 0,
     save_models: bool = False,
+    combo_config: CombinationConfig = None,
 ) -> List[WindowResult]:
     """
     Run a single combination with walk-forward validation.
@@ -1212,9 +1256,14 @@ def run_combination_walk_forward(
     from utils.metrics import PerformanceMetrics
     import copy
 
+    # Apply effective config if combo_config provided (with tuned HP params)
+    if combo_config:
+        config = combo_config.get_effective_config(config)
+
     if verbose:
+        config_name = combo_config.config_name if combo_config else "baseline"
         print(f"\n{'=' * 60}")
-        print(f"WALK-FORWARD: {strategy} + {allocation} @ {horizon}M")
+        print(f"WALK-FORWARD: {strategy} + {allocation} @ {horizon}M [{config_name}]")
         if holdout_years > 0:
             print(f"HOLDOUT: Last {holdout_years} years reserved (2023-2024)")
         print(f"{'=' * 60}")
@@ -1518,6 +1567,7 @@ def train_final_model(
     holdout_years: int = 2,
     holdout_start_date: str = None,
     verbose: bool = True,
+    combo_config: CombinationConfig = None,
 ):
     """
     Train final model on all data EXCEPT holdout period.
@@ -1542,6 +1592,10 @@ def train_final_model(
     """
     import copy
 
+    # Apply effective config if combo_config provided (with tuned HP params)
+    if combo_config:
+        config = combo_config.get_effective_config(config)
+
     # Determine cutoff date
     target_data = target_data.copy()
     target_data['timestamp'] = pd.to_datetime(target_data['timestamp'])
@@ -1560,8 +1614,9 @@ def train_final_model(
     train_targets = target_data[target_data['timestamp'] < cutoff_date].copy()
 
     if verbose:
+        config_name = combo_config.config_name if combo_config else "baseline"
         print(f"\n{'=' * 60}")
-        print(f"TRAINING FINAL MODEL: {strategy} + {allocation} @ {horizon}M")
+        print(f"TRAINING FINAL MODEL: {strategy} + {allocation} @ {horizon}M [{config_name}]")
         print(f"Training period: 2000-01-01 to {holdout_start_year - 1}-12-31")
         print(f"Holdout period: {holdout_start_year}-01-01 to {data_end_date.date()}")
         print(f"{'=' * 60}")
@@ -2070,6 +2125,7 @@ def train_fair_ensemble_models(
     holdout_start_date: str = None,
     holdout_years: int = 2,
     verbose: bool = True,
+    combo_config: CombinationConfig = None,
 ) -> Tuple[List, "FactorAllocationStrategy"]:
     """
     Train N models on same data (2000-holdout) with different seeds for fair ensemble.
@@ -2100,6 +2156,10 @@ def train_fair_ensemble_models(
     """
     import copy
 
+    # Apply effective config if combo_config provided (with tuned HP params)
+    if combo_config:
+        config = combo_config.get_effective_config(config)
+
     # Determine cutoff date
     target_data = target_data.copy()
     target_data['timestamp'] = pd.to_datetime(target_data['timestamp'])
@@ -2117,8 +2177,9 @@ def train_fair_ensemble_models(
     train_targets = target_data[target_data['timestamp'] < cutoff_date].copy()
 
     if verbose:
+        config_name = combo_config.config_name if combo_config else "baseline"
         print(f"\n{'=' * 60}")
-        print(f"TRAINING FAIR ENSEMBLE: {strategy} + {allocation} @ {horizon}M")
+        print(f"TRAINING FAIR ENSEMBLE: {strategy} + {allocation} @ {horizon}M [{config_name}]")
         print(f"Training period: 2000-01-01 to {holdout_start_year - 1}-12-31")
         print(f"Models: {n_models} with seeds {base_seed}, {base_seed + seed_step}, ...")
         print(f"{'=' * 60}")
