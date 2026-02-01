@@ -208,21 +208,30 @@ class IndicatorSelector:
         """
         Align pivoted macro data with target dates.
 
+        IMPORTANT: Features are lagged by 1 month relative to targets to prevent
+        forward-looking bias in feature selection. This means features from month M
+        are used to predict targets from month M+1.
+
         :param pivot_data (pd.DataFrame): Wide-format macro data
         :param target_data (pd.DataFrame): Target data
 
-        :return aligned_data (pd.DataFrame): Aligned features
+        :return aligned_data (pd.DataFrame): Aligned features (lagged by 1 month)
         :return aligned_targets (np.ndarray): Aligned target values
         """
         target_data = target_data.copy()
         target_data["month"] = target_data["timestamp"].dt.to_period("M")
 
-        # Find common months
-        common_months = set(pivot_data.index) & set(target_data["month"])
+        # Lag features by 1 month: use features[M] to predict target[M+1]
+        # Shift pivot_data index forward by 1 month for alignment
+        pivot_shifted = pivot_data.copy()
+        pivot_shifted.index = pivot_shifted.index + 1  # Period + 1 = next month
+
+        # Find common months between shifted features and targets
+        common_months = set(pivot_shifted.index) & set(target_data["month"])
         common_months = sorted(common_months)
 
         # Filter and align
-        aligned_features = pivot_data.loc[common_months]
+        aligned_features = pivot_shifted.loc[common_months]
         target_lookup = target_data.set_index("month")["target"]
         aligned_targets = np.array([target_lookup[m] for m in common_months])
 
@@ -341,7 +350,11 @@ class PCAFeatureReducer:
         """
         Fit PCA on feature matrix.
 
+        IMPORTANT: Only fit on TRAINING data to avoid data leakage.
+        Use transform() separately for test/validation data.
+
         :param X (np.ndarray): Feature matrix [n_samples, n_features]
+                               Must be training data only.
 
         :return self (PCAFeatureReducer): Fitted reducer
         """
@@ -381,10 +394,21 @@ class PCAFeatureReducer:
         """
         Fit and transform in one step.
 
+        WARNING: This method may cause data leakage if called on the entire
+        dataset (train + test). Use fit(X_train) then transform(X) separately
+        to ensure proper train/test separation.
+
         :param X (np.ndarray): Feature matrix
 
         :return X_reduced (np.ndarray): Reduced features
         """
+        import warnings
+        warnings.warn(
+            "PCAFeatureReducer.fit_transform() may cause data leakage. "
+            "Use fit(X_train) then transform(X) separately for proper train/test separation.",
+            UserWarning,
+            stacklevel=2,
+        )
         self.fit(X)
         return self.transform(X)
 
