@@ -113,59 +113,70 @@ def create_sample_data() -> pd.DataFrame:
 
 def compute_score(
     df: pd.DataFrame,
-    sharpe_weight: float = 0.4,
-    ic_weight: float = 0.3,
-    maxdd_weight: float = 0.3,
-    use_fixed_bounds: bool = True,
+    sharpe_weight: float = 0.35,
+    ic_weight: float = 0.25,
+    maxdd_weight: float = 0.30,
+    return_weight: float = 0.10,
+    reject_negative_ic_threshold: float = -0.3,
 ) -> pd.DataFrame:
     """
-    Compute composite score for each row.
+    Compute composite score with asymmetric IC penalty and exponential MaxDD.
 
-    :param df (pd.DataFrame): DataFrame with sharpe, ic, maxdd columns
+    Matches the formula in comparison_runner.compute_composite_score().
+
+    :param df (pd.DataFrame): DataFrame with sharpe, ic, maxdd, total_return columns
     :param sharpe_weight (float): Weight for Sharpe ratio in score
     :param ic_weight (float): Weight for IC in score
     :param maxdd_weight (float): Weight for MaxDD in score
-    :param use_fixed_bounds (bool): If True, use fixed normalization bounds for stable scores
+    :param return_weight (float): Weight for return bonus in score
+    :param reject_negative_ic_threshold (float): IC below this = score 0
 
     :return df (pd.DataFrame): DataFrame with score and rank columns added
     """
+    import numpy as np
     df = df.copy()
 
-    if use_fixed_bounds:
-        # Fixed bounds for stable scores regardless of filtered subset
-        # These bounds are based on typical ranges in factor allocation strategies
-        sharpe_min, sharpe_max = -0.5, 1.0  # Typical Sharpe range
-        ic_min, ic_max = -0.5, 0.5          # IC is a correlation, typically -0.5 to 0.5
-        maxdd_min, maxdd_max = -0.20, 0.0   # MaxDD typically -20% to 0%
-    else:
-        # Relative bounds (original behavior - scores change with filters)
-        sharpe_min, sharpe_max = df["sharpe"].min(), df["sharpe"].max()
-        ic_min, ic_max = df["ic"].min(), df["ic"].max()
-        maxdd_min, maxdd_max = df["maxdd"].min(), df["maxdd"].max()
+    # Fixed bounds for Sharpe normalization
+    sharpe_min, sharpe_max = -0.5, 1.5
 
-    def safe_normalize(x: float, xmin: float, xmax: float) -> float:
-        """Normalize value to [0, 1] with bounds clipping."""
-        if xmax - xmin < 1e-8:
-            return 0.5
-        # Clip to bounds to handle outliers
-        x_clipped = max(xmin, min(xmax, x))
-        return (x_clipped - xmin) / (xmax - xmin)
+    def compute_score_row(row):
+        sharpe = row["sharpe"]
+        ic = row["ic"]
+        maxdd = row["maxdd"]
+        total_return = row.get("total_return", 0)
 
-    df["sharpe_norm"] = df["sharpe"].apply(lambda x: safe_normalize(x, sharpe_min, sharpe_max))
-    df["ic_norm"] = df["ic"].apply(lambda x: safe_normalize(x, ic_min, ic_max))
-    # For maxdd, less negative is better, so we normalize (more negative = lower score)
-    df["maxdd_norm"] = df["maxdd"].apply(lambda x: safe_normalize(x, maxdd_min, maxdd_max))
+        # 1. Reject if IC very negative (inverted predictions)
+        if ic < reject_negative_ic_threshold:
+            return 0.0
 
-    df["score"] = (
-        sharpe_weight * df["sharpe_norm"]
-        + ic_weight * df["ic_norm"]
-        + maxdd_weight * df["maxdd_norm"]
-    )
+        # 2. Sharpe normalization [0, 1]
+        sharpe_norm = np.clip((sharpe - sharpe_min) / (sharpe_max - sharpe_min), 0, 1)
 
+        # 3. IC with asymmetric penalty (saturates at 100%, not 50%)
+        if ic >= 0:
+            ic_score = np.clip(ic, 0, 1)  # Positive IC: [0, 1.0] -> [0, 1]
+            ic_penalty = 0.0
+        else:
+            ic_score = 0.0  # Negative IC contributes nothing positive
+            ic_penalty = 2 * np.clip(-ic, 0, 1)  # Double penalty
+
+        # 4. MaxDD with exponential penalty
+        # -5% -> 0.86, -10% -> 0.74, -15% -> 0.64, -20% -> 0.55
+        maxdd_score = np.exp(3 * maxdd)  # maxdd is negative
+
+        # 5. Final score
+        score = (
+            sharpe_weight * sharpe_norm
+            + ic_weight * ic_score
+            + maxdd_weight * maxdd_score
+            + return_weight * (1 if total_return > 0 else 0)
+            - 0.15 * ic_penalty  # Explicit penalty for negative IC
+        )
+
+        return np.clip(score, 0, 1)
+
+    df["score"] = df.apply(compute_score_row, axis=1)
     df["rank"] = df["score"].rank(ascending=False).astype(int)
-
-    # Clean up temp columns
-    df = df.drop(columns=["sharpe_norm", "ic_norm", "maxdd_norm"])
 
     return df
 
@@ -239,24 +250,24 @@ def render_sidebar_filters(df: pd.DataFrame) -> Dict[str, List]:
     # Score weights
     st.sidebar.markdown("---")
     st.sidebar.markdown("## Score Weights")
-    sharpe_weight = st.sidebar.slider("Sharpe Weight", 0.0, 1.0, 0.4, 0.1)
-    ic_weight = st.sidebar.slider("IC Weight", 0.0, 1.0, 0.3, 0.1)
-    maxdd_weight = st.sidebar.slider("MaxDD Weight", 0.0, 1.0, 0.3, 0.1)
+    sharpe_weight = st.sidebar.slider("Sharpe Weight", 0.0, 1.0, 0.35, 0.05)
+    ic_weight = st.sidebar.slider("IC Weight", 0.0, 1.0, 0.25, 0.05)
+    maxdd_weight = st.sidebar.slider("MaxDD Weight", 0.0, 1.0, 0.30, 0.05)
+    return_weight = st.sidebar.slider("Return Weight", 0.0, 1.0, 0.10, 0.05)
 
     # Normalize weights
-    total_weight = sharpe_weight + ic_weight + maxdd_weight
+    total_weight = sharpe_weight + ic_weight + maxdd_weight + return_weight
     if total_weight > 0:
         sharpe_weight /= total_weight
         ic_weight /= total_weight
         maxdd_weight /= total_weight
+        return_weight /= total_weight
 
-    # Normalization mode
+    # Score formula info
     st.sidebar.markdown("---")
-    use_fixed_bounds = st.sidebar.checkbox(
-        "Fixed score bounds",
-        value=True,
-        help="If checked, scores use fixed normalization bounds (stable across filters). "
-             "If unchecked, scores are relative to the displayed subset."
+    st.sidebar.info(
+        "Score uses asymmetric IC penalty (negative IC penalized 2x) "
+        "and exponential MaxDD penalty. Models with IC < -30% are rejected."
     )
 
     return {
@@ -267,7 +278,7 @@ def render_sidebar_filters(df: pd.DataFrame) -> Dict[str, List]:
         "sharpe_weight": sharpe_weight,
         "ic_weight": ic_weight,
         "maxdd_weight": maxdd_weight,
-        "use_fixed_bounds": use_fixed_bounds,
+        "return_weight": return_weight,
     }
 
 
@@ -288,7 +299,7 @@ def apply_filters(df: pd.DataFrame, filters: Dict) -> pd.DataFrame:
             sharpe_weight=filters["sharpe_weight"],
             ic_weight=filters["ic_weight"],
             maxdd_weight=filters["maxdd_weight"],
-            use_fixed_bounds=filters.get("use_fixed_bounds", True),
+            return_weight=filters.get("return_weight", 0.10),
         )
 
     return filtered_df
@@ -664,8 +675,8 @@ def render_cumulative_returns(df: pd.DataFrame, benchmarks_df: pd.DataFrame = No
         st.info("Monthly returns data not available. Re-export results from notebook to enable this chart.")
         return
 
-    # Get top N models by Sharpe
-    top_models = df.nlargest(top_n, "sharpe").copy()
+    # Get top N models by Score
+    top_models = df.nlargest(top_n, "score").copy()
 
     # Filter models that have monthly returns data
     top_models = top_models[top_models["monthly_returns"].str.len() > 0]
@@ -749,7 +760,7 @@ def render_cumulative_returns(df: pd.DataFrame, benchmarks_df: pd.DataFrame = No
     ax.axhline(y=1, color="gray", linestyle="-", linewidth=0.5, alpha=0.5)
     ax.set_xlabel("Month (Holdout)")
     ax.set_ylabel("Cumulative Return (Wealth)")
-    ax.set_title(f"Top {top_n} Models vs Benchmarks: Cumulative Returns", fontweight="bold")
+    ax.set_title(f"Top {top_n} Models (by Score) vs Benchmarks: Cumulative Returns", fontweight="bold")
     ax.legend(loc="upper left", fontsize=9)
     ax.grid(True, alpha=0.3)
 
@@ -777,12 +788,8 @@ def render_benchmarks_comparison(df: pd.DataFrame, benchmarks_df: pd.DataFrame):
     )
     metric_col = metric_options[selected_metric_label]
 
-    # Get top 3 models by selected metric
-    # For maxdd, lower is better (less negative), so we use nsmallest with ascending=False
-    if metric_col == "maxdd":
-        top_models = df.nsmallest(3, "maxdd")[["strategy", "allocation", "horizon", "model_type", "sharpe", "maxdd", "total_return"]].copy()
-    else:
-        top_models = df.nlargest(3, metric_col)[["strategy", "allocation", "horizon", "model_type", "sharpe", "maxdd", "total_return"]].copy()
+    # Get top 3 models by SCORE (always the same regardless of displayed metric)
+    top_models = df.nlargest(3, "score")[["strategy", "allocation", "horizon", "model_type", "sharpe", "maxdd", "total_return", "score"]].copy()
 
     type_abbrev = {"Final": "F", "Fair Ensemble": "FE", "WF Ensemble": "WF"}
     top_models["name"] = top_models.apply(
@@ -819,7 +826,7 @@ def render_benchmarks_comparison(df: pd.DataFrame, benchmarks_df: pd.DataFrame):
     else:
         ax.set_xlabel(f"{selected_metric_label} (%)")
         ax.xaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: f"{x:.0f}%"))
-    ax.set_title(f"Top 3 Models vs Benchmarks ({selected_metric_label})", fontweight="bold")
+    ax.set_title(f"Top 3 Models (by Score) vs Benchmarks - {selected_metric_label}", fontweight="bold")
     ax.grid(True, alpha=0.3, axis="x")
 
     # Legend
