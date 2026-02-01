@@ -474,32 +474,44 @@ class BaselineRegularization(nn.Module):
 
 class SharpeRatioLoss(nn.Module):
     """
-    Differentiable approximation of negative Sharpe ratio loss.
+    Differentiable Sharpe ratio loss with running std for gradient stability.
 
-    Loss = -E[R] + gamma * Var[R] + lambda * turnover + beta * baseline_deviation
+    Loss = -mean(R) / std(R) + lambda * turnover + beta * baseline_deviation
 
-    :param gamma (float): Risk aversion coefficient
+    Uses running std estimation across batches to stabilize gradients.
+
+    :param gamma (float): Risk aversion coefficient (0 = pure Sharpe, >0 adds variance penalty)
     :param turnover_penalty (float): Turnover penalty coefficient (calibrated)
     :param baseline_penalty (float): Baseline regularization penalty
+    :param use_running_stats (bool): Use running std for stable gradients
+    :param momentum (float): Momentum for running std update
     """
 
     def __init__(
         self,
-        gamma: float = 1.0,
+        gamma: float = 0.0,
         turnover_penalty: float = 0.01,
         baseline_penalty: float = 0.0,
+        use_running_stats: bool = True,
+        momentum: float = 0.99,
     ):
         """
         Initialize Sharpe ratio loss.
 
-        :param gamma (float): Risk aversion (higher = more risk-averse)
+        :param gamma (float): Risk aversion (0 = pure Sharpe, >0 adds variance penalty)
         :param turnover_penalty (float): Penalty for weight changes
         :param baseline_penalty (float): Penalty for deviation from baseline
+        :param use_running_stats (bool): Use running std for stable gradients
+        :param momentum (float): Momentum for running std update
         """
         super().__init__()
         self.gamma = gamma
         self.turnover_penalty = turnover_penalty
         self.baseline_penalty = baseline_penalty
+        self.use_running_stats = use_running_stats
+        self.momentum = momentum
+        # Running std buffer for stable gradients
+        self.register_buffer('running_std', torch.tensor(0.01))
 
     def forward(
         self,
@@ -509,7 +521,7 @@ class SharpeRatioLoss(nn.Module):
         baseline_deviation: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
-        Compute Sharpe-based loss.
+        Compute true Sharpe ratio loss.
 
         :param weights (torch.Tensor): Predicted weights [batch, num_factors]
         :param returns (torch.Tensor): Factor returns [batch, num_factors]
@@ -521,12 +533,28 @@ class SharpeRatioLoss(nn.Module):
         # Portfolio return
         portfolio_return = (weights * returns).sum(dim=-1)
 
-        # Mean and variance
+        # Mean and std
         mean_return = portfolio_return.mean()
-        var_return = portfolio_return.var()
+        batch_std = portfolio_return.std()
 
-        # Base loss (negative Sharpe approximation)
-        loss = -mean_return + self.gamma * var_return
+        # Update running std (only in training mode)
+        if self.training and self.use_running_stats:
+            with torch.no_grad():
+                self.running_std = self.momentum * self.running_std + (1 - self.momentum) * batch_std
+
+        # Use running std for stable gradients, or batch std
+        std_return = self.running_std + 1e-8 if self.use_running_stats else batch_std + 1e-8
+
+        # TRUE Sharpe ratio (annualized: sqrt(12) for monthly data)
+        sharpe_ratio = mean_return / std_return * 3.464  # sqrt(12) = 3.464
+
+        # Base loss: negative Sharpe (minimize loss = maximize Sharpe)
+        loss = -sharpe_ratio
+
+        # Optional: additional variance penalty if gamma > 0
+        if self.gamma > 0:
+            variance_penalty = self.gamma * portfolio_return.var()
+            loss = loss + variance_penalty
 
         # Turnover penalty
         if prev_weights is not None:

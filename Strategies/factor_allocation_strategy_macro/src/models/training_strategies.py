@@ -30,6 +30,7 @@ from scipy.optimize import minimize
 
 from .transformer import SharpeRatioLoss, BaselineRegularization, calibrate_turnover_penalty
 from .pretraining import pretrain_embeddings, transfer_pretrained_embeddings
+from utils.training_utils import EarlyStopping, ModelCheckpoint
 
 
 @dataclass
@@ -48,12 +49,15 @@ class TrainingConfig:
     :param baseline_penalty (float): Baseline regularization weight
     :param transaction_cost_bps (float): Transaction cost in basis points
     :param rolling_window_months (int): Rolling window for Sharpe calculation (Supervised)
-    :param gamma (float): Risk aversion for Sharpe loss
+    :param gamma (float): Risk aversion for Sharpe loss (0 = pure Sharpe)
     :param horizon_months (int): Prediction horizon for Sharpe optimization (1, 3, 6, or 12)
+    :param early_stopping (bool): Enable early stopping
+    :param early_stopping_patience (int): Epochs to wait before stopping
+    :param early_stopping_min_delta (float): Minimum improvement threshold
     """
     learning_rate: float = 0.0005
-    batch_size: int = 32
-    weight_decay: float = 0.01
+    batch_size: int = 64            # Increased from 32
+    weight_decay: float = 0.05      # Increased from 0.01
     epochs_phase1: int = 30
     epochs_phase2: int = 20
     epochs_phase3: int = 20
@@ -61,9 +65,13 @@ class TrainingConfig:
     use_baseline_reg: bool = True
     baseline_penalty: float = 0.1
     transaction_cost_bps: float = 10.0
-    rolling_window_months: int = 12
-    gamma: float = 1.0
+    rolling_window_months: int = 24  # Increased from 12 for stability
+    gamma: float = 0.0              # Changed to 0 for true Sharpe
     horizon_months: int = 1
+    # Early stopping
+    early_stopping: bool = True
+    early_stopping_patience: int = 5
+    early_stopping_min_delta: float = 0.001
 
 
 def compute_optimal_weights(
@@ -350,6 +358,18 @@ class SupervisedTrainer:
                 weight_targets.append(np.ones(6) / 6)
         weight_targets = torch.tensor(np.array(weight_targets), dtype=torch.float32)
 
+        # Early stopping and model checkpoint
+        early_stopper = None
+        checkpoint = None
+        if self.config.early_stopping:
+            early_stopper = EarlyStopping(
+                patience=self.config.early_stopping_patience,
+                min_delta=self.config.early_stopping_min_delta,
+                mode='min',  # Minimize loss
+                verbose=verbose,
+            )
+            checkpoint = ModelCheckpoint(mode='min')
+
         total_epochs = self.config.epochs_phase3
         for epoch in range(total_epochs):
             self.model.train()
@@ -383,8 +403,22 @@ class SupervisedTrainer:
             train_loss /= max(batch_idx, 1)
             history["train_loss"].append(train_loss)
 
+            # Early stopping check
+            if early_stopper is not None:
+                checkpoint(self.model, train_loss)
+                if early_stopper(train_loss, epoch):
+                    if verbose:
+                        print(f"Early stopping at epoch {epoch + 1}")
+                    break
+
             if verbose and (epoch + 1) % 10 == 0:
                 print(f"Epoch {epoch + 1}/{total_epochs}: Train Loss: {train_loss:.6f}")
+
+        # Restore best model weights
+        if checkpoint is not None and checkpoint.best_weights is not None:
+            checkpoint.restore(self.model)
+            if verbose:
+                print(f"Restored best model (loss: {checkpoint.best_score:.6f})")
 
         return history
 

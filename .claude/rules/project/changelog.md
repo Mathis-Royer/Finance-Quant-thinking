@@ -7,7 +7,8 @@
 
 | # | Date | Modification |
 |---|------|--------------|
-| 1 | 2026-02-01 | **Fixed percentage formatting issues**: (1) **Total Return double conversion fixed**: removed `*100` in `comparison_runner.py` (now stored as decimal like 0.0835 for 8.35%). Removed `/100` in `export_results.py` and `holdout_plots.py`. (2) **Sharpe ratio no longer displayed as percentage**: Sharpe is a ratio (e.g., 0.85, 1.20), not a percentage. Removed all `*100` and `%` formatting for Sharpe across `comparison_runner.py`, `holdout_plots.py`, and `app.py`. Now displays as plain number with 2 decimals. (3) IC, MaxDD, Total Return, and Score remain as percentages. |
+| 1 | 2026-02-01 | **Enhanced training with regularization and score improvements**: (1) **New EarlyStopping + ModelCheckpoint** in `src/utils/training_utils.py`, (2) **Improved composite score**: asymmetric IC penalty (negative IC penalized 2x), exponential MaxDD penalty `exp(3×maxdd)`, rejection of models with IC < -30%, (3) **Fixed SharpeRatioLoss**: true Sharpe ratio `-mean/std` with running std for gradient stability (was approximation `-mean + γ×var`), (4) **Enhanced regularization**: dropout 0.6→0.75, weight_decay 0.01→0.05, batch_size 32→64, learning_rate 0.001→0.0005, (5) **Increased rolling window** for Supervised optimal weights: 12→24 months. **All modes kept**: Binary, E2E, Sup, Multi, Fair Ensemble. |
+| 2 | 2026-02-01 | **Fixed percentage formatting issues**: (1) **Total Return double conversion fixed**: removed `*100` in `comparison_runner.py` (now stored as decimal like 0.0835 for 8.35%). Removed `/100` in `export_results.py` and `holdout_plots.py`. (2) **Sharpe ratio no longer displayed as percentage**: Sharpe is a ratio (e.g., 0.85, 1.20), not a percentage. Removed all `*100` and `%` formatting for Sharpe across `comparison_runner.py`, `holdout_plots.py`, and `app.py`. Now displays as plain number with 2 decimals. (3) IC, MaxDD, Total Return, and Score remain as percentages. |
 | 2 | 2026-02-01 | **Added Streamlit dashboard for interactive results exploration**: New `dashboard/app.py` with interactive filters (Strategy, Allocation, Type, Horizon), adjustable score weights, results table with averages, multiple visualizations (bar charts, heatmaps, scatter plots), pivot tables, and benchmark comparisons. Run with `streamlit run dashboard/app.py`. Added `dashboard/export_results.py` for caching results. |
 | 3 | 2026-02-01 | **Centralized notebook imports with reload function**: New imports cell at top of notebook with all module imports and `reload_all()` function. Removed duplicate imports from other cells. After modifying source code, call `reload_all()` to refresh modules without kernel restart. |
 | 4 | 2026-02-01 | **Added Fair Ensemble for unbiased comparison**: New `train_fair_ensemble_models()` trains N models on same data (2000-2021) with different seeds, eliminating data quantity bias in WF Ensemble. Added `run_bias_analysis()` to decompose effects (data quantity, seed variance, pure ensemble). Step 3 now evaluates **Final vs Fair Ensemble vs WF Ensemble**. Fair Ensemble is the recommended production ensemble. |
@@ -26,13 +27,26 @@ Factor allocation strategy using **Point-in-Time FRED-MD** macroeconomic data wi
 
 - **Status**: Development/Research
 - **Model**: MICRO Transformer only (12k params, d_model=32, 1 layer, 1 head)
+- **Pipeline**: 16 combinations (2 strategies × 2 allocations × 4 horizons)
+  - Strategies: E2E (3-phase), Supervised
+  - Allocations: Binary (2F), Multi (6F)
+  - Horizons: 1M, 3M, 6M, 12M
 - **Evaluation Methodology** (rigorous 3-step):
   1. **Walk-forward (2017-2021)**: N models, non-overlapping test periods, holdout reserved
   2. **Final model**: Trained on 2000-2021 (all data except holdout) for production
   3. **Holdout comparison (2022+)**: **Final vs Fair Ensemble vs WF Ensemble**
-     - **Fair Ensemble** (new): 5 models on same data (2000-2021), different seeds
+     - **Fair Ensemble**: 5 models on same data (2000-2021), different seeds
      - **WF Ensemble**: N models from walk-forward (biased: different data quantities)
-     - Fair comparison isolates pure ensemble effect
+- **Enhanced regularization** (reduces overfitting):
+  - `dropout=0.75` (was 0.6)
+  - `weight_decay=0.05` (was 0.01)
+  - `learning_rate=0.0005` (was 0.001)
+  - `batch_size=64` (was 32)
+  - **Early stopping** enabled (patience=5)
+  - **Rolling window**: 24 months (was 12) for Supervised optimal weights
+- **Improved training**:
+  - **SharpeRatioLoss**: True Sharpe ratio `-mean/std` with running std for gradient stability
+  - **EarlyStopping + ModelCheckpoint**: Auto-stop training, restore best weights
 - **Defaults**: `RUN_TUNING=False`, `USE_FEATURE_SELECTION=False`, `train_fair_ensemble=True`
 - **Main features**:
   - Point-in-time data loading exclusively (305 FRED-MD vintages)
@@ -50,7 +64,9 @@ Factor allocation strategy using **Point-in-Time FRED-MD** macroeconomic data wi
 - **Dashboard**: Streamlit app (`dashboard/app.py`) for interactive exploration with filters, adjustable score weights, and visualizations
 - **Visualizations**: 4 heatmaps (return × year × horizon), 2×2 cumulative returns grid, total returns bar chart, max drawdown bar chart, holdout comparison with Delta heatmap
 - **Benchmarks**: Equal-Weight 6F, 50/50 Cyc/Def, Risk Parity, Factor Momentum, Best Single Factor
-- **Composite scoring**: All summary tables include Score = 0.4×Sharpe + 0.3×IC + 0.3×MaxDD with **fixed normalization bounds** (stable across filters) and Rank columns
+- **Composite scoring**: Score = 0.35×Sharpe + 0.25×IC + 0.30×MaxDD + 0.10×Return
+  - **Asymmetric IC penalty**: Negative IC penalized 2x, models with IC < -30% rejected
+  - **Exponential MaxDD penalty**: `exp(3×maxdd)` more severe for large drawdowns
 - **Benchmark reference lines**: All bar plots show best benchmark as dashed purple line for easy comparison
 
 ---

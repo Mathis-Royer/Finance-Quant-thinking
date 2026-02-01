@@ -50,6 +50,15 @@ class EvaluationConfig:
     # Bias analysis configuration
     run_bias_analysis: bool = False
     bias_cutoff_years: List[int] = field(default_factory=lambda: [2014, 2017, 2020])
+    # Enhanced regularization settings
+    dropout: float = 0.75           # Increased from 0.6
+    weight_decay: float = 0.05      # Increased from 0.01
+    learning_rate: float = 0.0005   # Reduced from 0.001
+    batch_size: int = 64            # Increased from 32
+    # Early stopping configuration
+    early_stopping: bool = True
+    early_stopping_patience: int = 5
+    early_stopping_min_delta: float = 0.001
 
 
 @dataclass

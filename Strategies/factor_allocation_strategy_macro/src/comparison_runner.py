@@ -529,61 +529,76 @@ def compute_composite_score(
     sharpe_col: str = 'sharpe',
     ic_col: str = 'ic',
     maxdd_col: str = 'maxdd',
+    total_return_col: str = None,
     weights: Dict[str, float] = None,
-    use_fixed_bounds: bool = True,
+    reject_negative_ic_threshold: float = -0.3,
 ) -> pd.DataFrame:
     """
-    Compute composite score for a DataFrame with Sharpe, IC, and MaxDD columns.
+    Compute composite score with asymmetric IC penalty and exponential MaxDD.
 
-    Score = w_sharpe × Sharpe_norm + w_ic × IC_norm + w_dd × (1 - |MaxDD|_norm)
+    Score formula:
+    - Sharpe: linear normalization [0, 1]
+    - IC: asymmetric (positive contributes, negative penalizes 2x)
+    - MaxDD: exponential penalty (more severe for large drawdowns)
+    - Return bonus: +0.1 if positive, -0.05 if negative
 
-    Higher score = better model.
+    Models with IC < reject_threshold are assigned score = 0 (rejected).
 
     :param df (pd.DataFrame): DataFrame with metrics columns
     :param sharpe_col (str): Column name for Sharpe ratio
     :param ic_col (str): Column name for IC
     :param maxdd_col (str): Column name for MaxDD
-    :param weights (Dict): Weights for each metric (default: sharpe=0.4, ic=0.3, maxdd=0.3)
-    :param use_fixed_bounds (bool): If True, use fixed normalization bounds for stable scores
+    :param total_return_col (str): Optional column for total return (for bonus)
+    :param weights (Dict): Weights dict (default: sharpe=0.35, ic=0.25, maxdd=0.30, return=0.10)
+    :param reject_negative_ic_threshold (float): IC below this = score 0
 
     :return df (pd.DataFrame): DataFrame with 'score' and 'rank' columns added
     """
     if weights is None:
-        weights = {'sharpe': 0.4, 'ic': 0.3, 'maxdd': 0.3}
+        weights = {'sharpe': 0.35, 'ic': 0.25, 'maxdd': 0.30, 'return': 0.10}
 
     df = df.copy()
 
-    if use_fixed_bounds:
-        # Fixed bounds for stable scores regardless of filtered subset
-        sharpe_min, sharpe_max = -0.5, 1.0  # Typical Sharpe range
-        ic_min, ic_max = -0.5, 0.5          # IC is a correlation
-        maxdd_min, maxdd_max = -0.20, 0.0   # MaxDD typically -20% to 0%
-    else:
-        # Relative bounds (original behavior)
-        sharpe_min, sharpe_max = df[sharpe_col].min(), df[sharpe_col].max()
-        ic_min, ic_max = df[ic_col].min(), df[ic_col].max()
-        maxdd_min, maxdd_max = df[maxdd_col].min(), df[maxdd_col].max()
+    # Fixed bounds for Sharpe normalization
+    sharpe_min, sharpe_max = -0.5, 1.5
 
-    def safe_normalize(series: pd.Series, xmin: float, xmax: float) -> pd.Series:
-        """Normalize series to [0, 1] with bounds clipping."""
-        if xmax - xmin < 1e-8:
-            return pd.Series([0.5] * len(series), index=series.index)
-        clipped = series.clip(lower=xmin, upper=xmax)
-        return (clipped - xmin) / (xmax - xmin)
+    def compute_score_row(row):
+        sharpe = row[sharpe_col]
+        ic = row[ic_col]
+        maxdd = row[maxdd_col]
+        total_return = row.get(total_return_col, 0) if total_return_col else 0
 
-    # Normalize each metric to [0, 1]
-    sharpe_norm = safe_normalize(df[sharpe_col], sharpe_min, sharpe_max)
-    ic_norm = safe_normalize(df[ic_col], ic_min, ic_max)
-    maxdd_norm = safe_normalize(df[maxdd_col], maxdd_min, maxdd_max)
+        # 1. Reject if IC very negative (inverted predictions)
+        if ic < reject_negative_ic_threshold:
+            return 0.0
 
-    # Compute composite score
-    df['score'] = (
-        weights['sharpe'] * sharpe_norm +
-        weights['ic'] * ic_norm +
-        weights['maxdd'] * maxdd_norm
-    )
+        # 2. Sharpe normalization [0, 1]
+        sharpe_norm = np.clip((sharpe - sharpe_min) / (sharpe_max - sharpe_min), 0, 1)
 
-    # Rank (1 = best)
+        # 3. IC with asymmetric penalty (saturates at 100%, not 50%)
+        if ic >= 0:
+            ic_score = np.clip(ic, 0, 1)  # Positive IC: [0, 1.0] -> [0, 1]
+            ic_penalty = 0.0
+        else:
+            ic_score = 0.0  # Negative IC contributes nothing positive
+            ic_penalty = 2 * np.clip(-ic, 0, 1)  # Double penalty
+
+        # 4. MaxDD with exponential penalty
+        # -5% -> 0.86, -10% -> 0.74, -15% -> 0.64, -20% -> 0.55
+        maxdd_score = np.exp(3 * maxdd)  # maxdd is negative
+
+        # 5. Final score
+        score = (
+            weights['sharpe'] * sharpe_norm
+            + weights['ic'] * ic_score
+            + weights['maxdd'] * maxdd_score
+            + weights['return'] * (1 if total_return > 0 else 0)
+            - 0.15 * ic_penalty  # Explicit penalty for negative IC
+        )
+
+        return np.clip(score, 0, 1)
+
+    df['score'] = df.apply(compute_score_row, axis=1)
     df['rank'] = df['score'].rank(ascending=False).astype(int)
 
     return df

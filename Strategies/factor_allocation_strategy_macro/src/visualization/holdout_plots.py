@@ -919,11 +919,11 @@ def plot_all_holdout(
     print_holdout_summary_table(all_holdout_results, compute_score_fn)
 
     # Build comparison table: Top 3 models + Benchmarks
-    print("\n" + "=" * 90)
+    print("\n" + "=" * 100)
     print("TOP 3 MODELS vs BENCHMARKS (Holdout Period)")
-    print("=" * 90)
-    print(f"{'Name':<25} {'Sharpe':>10} {'IC':>10} {'MaxDD':>10} {'Return':>12}")
-    print("-" * 90)
+    print("=" * 100)
+    print(f"{'Name':<25} {'Sharpe':>10} {'IC':>10} {'MaxDD':>10} {'Return':>12} {'Score':>10}")
+    print("-" * 100)
 
     # Get top 3 models (all types)
     all_models = []
@@ -960,21 +960,32 @@ def plot_all_holdout(
                 'maxdd': wf_ens.maxdd,
             })
 
-    all_models.sort(key=lambda x: x['sharpe'], reverse=True)
+    # Compute scores if function provided
+    if compute_score_fn is not None and all_models:
+        import pandas as pd
+        df_models = pd.DataFrame(all_models)
+        df_with_scores = compute_score_fn(df_models, total_return_col='total_return')
+        for i, m in enumerate(all_models):
+            m['score'] = df_with_scores.loc[df_with_scores['name'] == m['name'], 'score'].values[0]
+    else:
+        for m in all_models:
+            m['score'] = 0.0
+
+    all_models.sort(key=lambda x: x['score'], reverse=True)
     for m in all_models[:3]:
         print(f"{m['name']:<25} {m['sharpe']:>+10.2f} {m['ic']*100:>+10.1f}% "
-              f"{m['maxdd']:>+10.1%} {m['total_return']:>+11.1%}")
+              f"{m['maxdd']:>+10.1%} {m['total_return']:>+11.1%} {m['score']:>10.2%}")
 
-    print("-" * 90)
+    print("-" * 100)
 
-    # Print benchmarks
+    # Print benchmarks (no score for benchmarks)
     if benchmarks:
         for bm_key, bm_result in benchmarks.items():
             if bm_result:
                 ic_val = getattr(bm_result, 'ic', 0.0) or 0.0
                 print(f"{bm_result.name:<25} {bm_result.sharpe:>+10.2f} {ic_val*100:>+10.1f}% "
-                      f"{bm_result.maxdd:>+10.1%} {bm_result.total_return:>+11.1%}")
+                      f"{bm_result.maxdd:>+10.1%} {bm_result.total_return:>+11.1%} {'N/A':>10}")
 
-    print("=" * 90)
+    print("=" * 100)
 
     return figures
