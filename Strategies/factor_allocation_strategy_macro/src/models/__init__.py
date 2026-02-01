@@ -3,7 +3,9 @@
 from .embeddings import MacroTokenEmbedding
 from .transformer import (
     FactorAllocationTransformer,
+    RotaryPositionalEmbedding,
     SharpeRatioLoss,
+    SortinoLoss,
     BaselineRegularization,
     calibrate_turnover_penalty,
 )
@@ -24,7 +26,9 @@ from .training_strategies import (
 __all__ = [
     "MacroTokenEmbedding",
     "FactorAllocationTransformer",
+    "RotaryPositionalEmbedding",
     "SharpeRatioLoss",
+    "SortinoLoss",
     "BaselineRegularization",
     "calibrate_turnover_penalty",
     "ExecutionGate",

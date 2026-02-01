@@ -13,8 +13,8 @@ from dataclasses import dataclass
 import pandas as pd
 import numpy as np
 
-from utils.keys import unpack_key
-from utils.constants import (
+from .keys import unpack_key
+from .constants import (
     MODEL_TYPE_ABBREV,
     MODEL_TYPE_ORDER,
     STRATEGY_ABBREV,
@@ -103,6 +103,20 @@ def flatten_holdout_results(
             a_abbrev = ALLOCATION_ABBREV.get(allocation, allocation[0])
             config_suffix = CONFIG_SUFFIX.get(config, "") if config != "baseline" else ""
 
+            # Compute composite score for ranking
+            sharpe_norm = (r.sharpe + 1) / 4
+            sharpe_norm = max(0, min(1, sharpe_norm))
+            if r.ic < 0:
+                ic_norm = (0.5 + r.ic) * 0.5
+            else:
+                ic_norm = 0.5 + r.ic
+            ic_norm = max(0, min(1, ic_norm))
+            maxdd_penalty = np.exp(3 * abs(r.maxdd)) - 1
+            maxdd_norm = 1 - min(maxdd_penalty / 3, 1)
+            return_norm = (r.total_return + 0.5) / 1.5
+            return_norm = max(0, min(1, return_norm))
+            score = 0.35 * sharpe_norm + 0.25 * ic_norm + 0.30 * maxdd_norm + 0.10 * return_norm
+
             records.append({
                 "strategy": strategy,
                 "allocation": allocation,
@@ -114,6 +128,7 @@ def flatten_holdout_results(
                 "ic": r.ic,
                 "maxdd": r.maxdd,
                 "total_return": r.total_return,
+                "score": score,
             })
 
     return records
@@ -341,26 +356,157 @@ def print_model_comparison_summary(
     """
     Print formatted summary of Final vs Fair Ensemble vs WF Ensemble comparisons.
 
+    Uses composite score for winner determination instead of Sharpe ratio.
+
     :param holdout_summary (pd.DataFrame): Summary DataFrame with model_type column
     """
-    # Final vs Fair Ensemble (fair comparison)
+    # Final vs Fair Ensemble (fair comparison) - using score
     final_vs_fair = compare_model_types(
-        holdout_summary, "Final", "Fair Ensemble", "sharpe"
+        holdout_summary, "Final", "Fair Ensemble", "score"
     )
 
     print(
-        f"\nFINAL vs FAIR ENSEMBLE (fair comparison): "
+        f"\nFINAL vs FAIR ENSEMBLE (fair comparison, by Score): "
         f"{final_vs_fair.type_a_wins} Final wins, "
         f"{final_vs_fair.type_b_wins} Fair Ensemble wins"
     )
 
-    # Fair Ensemble vs WF Ensemble (data quantity effect)
+    # Fair Ensemble vs WF Ensemble (data quantity effect) - using score
     fair_vs_wf = compute_delta_stats(
-        holdout_summary, "Fair Ensemble", "WF Ensemble", "sharpe"
+        holdout_summary, "Fair Ensemble", "WF Ensemble", "score"
     )
 
     print(
-        f"FAIR vs WF ENSEMBLE (data quantity effect): "
+        f"FAIR vs WF ENSEMBLE (data quantity effect, by Score): "
         f"Fair {fair_vs_wf.type_a_better}, WF {fair_vs_wf.type_b_better}, "
-        f"Avg Delta: {fair_vs_wf.avg_delta:+.4f} Sharpe"
+        f"Avg Delta: {fair_vs_wf.avg_delta:+.4f} Score"
     )
+
+
+def print_statistical_analysis(
+    holdout_results: HoldoutResults,
+    benchmarks: Optional[Dict[str, Any]] = None,
+    confidence_level: float = 0.95,
+    n_bootstrap: int = 1000,
+) -> None:
+    """
+    Print statistical analysis with bootstrap CIs and significance tests.
+
+    Analyzes the top 3 models by composite score and compares them
+    to the best benchmark using:
+    - Bootstrap confidence intervals for Sharpe ratios
+    - Lo (2002) significance test for individual Sharpe ratios
+    - Jobson-Korkie test for comparing two Sharpe ratios
+
+    :param holdout_results (HoldoutResults): Holdout results dictionary
+    :param benchmarks (Optional[Dict]): Optional benchmarks dictionary with monthly_returns
+    :param confidence_level (float): Confidence level for bootstrap CIs (default 0.95)
+    :param n_bootstrap (int): Number of bootstrap samples (default 1000)
+    """
+    from .statistics import (
+        bootstrap_sharpe_ratio,
+        test_sharpe_significance,
+        compare_sharpe_ratios,
+    )
+
+    # Flatten results and find top models by score
+    records = flatten_holdout_results(holdout_results)
+    if not records:
+        print("No holdout results available for statistical analysis.")
+        return
+
+    # Compute scores and sort
+    for r in records:
+        # Simple composite score for ranking
+        sharpe_norm = (r["sharpe"] + 1) / 4
+        ic_norm = 0.5 + r["ic"] if r["ic"] >= 0 else (0.5 + r["ic"]) * 0.5
+        maxdd_norm = 1 - min(abs(r["maxdd"]) * 2, 1)
+        return_norm = (r["total_return"] + 0.5) / 1.5
+        r["score"] = 0.35 * sharpe_norm + 0.25 * ic_norm + 0.30 * maxdd_norm + 0.10 * return_norm
+
+    records_sorted = sorted(records, key=lambda x: x["score"], reverse=True)
+    top_models = records_sorted[:3]
+
+    # Get monthly returns for top models
+    model_returns = {}
+    for model in top_models:
+        key = (model["strategy"], model["allocation"], model["horizon"], model["config"])
+        if key in holdout_results and holdout_results[key] is not None:
+            result = holdout_results[key]
+            model_type = model["model_type"]
+            if model_type in result and result[model_type] is not None:
+                r = result[model_type]
+                if hasattr(r, "monthly_returns") and r.monthly_returns is not None:
+                    model_returns[model["name"]] = np.array(r.monthly_returns)
+
+    if not model_returns:
+        print("No monthly returns available for statistical analysis.")
+        print("(Models need 'monthly_returns' attribute in holdout results)")
+        return
+
+    # Get best benchmark returns
+    benchmark_returns = None
+    benchmark_name = None
+    if benchmarks:
+        best_bench = max(benchmarks.items(), key=lambda x: x[1].sharpe)
+        benchmark_name = best_bench[0]
+        if hasattr(best_bench[1], "monthly_returns") and best_bench[1].monthly_returns is not None:
+            benchmark_returns = np.array(best_bench[1].monthly_returns)
+
+    # Print header
+    print("\n" + "=" * 90)
+    print("STATISTICAL ANALYSIS (Bootstrap CIs & Significance Tests)")
+    print("=" * 90)
+    print(f"Bootstrap samples: {n_bootstrap}, Confidence level: {confidence_level:.0%}")
+    print("-" * 90)
+
+    # Analyze each top model
+    print(f"\n{'Model':<35} {'Sharpe':>8} {'95% CI':>18} {'p-value':>10} {'Signif':>8}")
+    print("-" * 90)
+
+    for name, returns in model_returns.items():
+        # Bootstrap CI
+        ci = bootstrap_sharpe_ratio(
+            returns,
+            n_bootstrap=n_bootstrap,
+            confidence_level=confidence_level,
+        )
+
+        # Significance test (H0: Sharpe = 0)
+        sig = test_sharpe_significance(returns, alpha=0.05)
+
+        ci_str = f"[{ci.ci_lower:+.3f}, {ci.ci_upper:+.3f}]"
+        signif_str = "Yes ***" if sig.p_value < 0.01 else ("Yes **" if sig.p_value < 0.05 else ("Yes *" if sig.p_value < 0.10 else "No"))
+
+        print(f"{name:<35} {ci.estimate:>+8.3f} {ci_str:>18} {sig.p_value:>10.4f} {signif_str:>8}")
+
+    # Benchmark comparison
+    if benchmark_returns is not None and len(model_returns) > 0:
+        print("-" * 90)
+        print(f"\nCOMPARISON vs BEST BENCHMARK ({benchmark_name})")
+        print(f"{'Model':<35} {'Delta SR':>10} {'p-value':>10} {'Signif':>10}")
+        print("-" * 90)
+
+        # Bootstrap CI for benchmark
+        bench_ci = bootstrap_sharpe_ratio(benchmark_returns, n_bootstrap=n_bootstrap)
+        print(f"{'Benchmark: ' + benchmark_name:<35} {bench_ci.estimate:>+10.3f}")
+
+        for name, returns in model_returns.items():
+            # Jobson-Korkie test comparing model vs benchmark
+            comparison = compare_sharpe_ratios(
+                returns,
+                benchmark_returns,
+                alpha=0.05,
+            )
+
+            signif_str = "Yes ***" if comparison.p_value < 0.01 else (
+                "Yes **" if comparison.p_value < 0.05 else (
+                    "Yes *" if comparison.p_value < 0.10 else "No"
+                )
+            )
+
+            print(f"{name:<35} {comparison.difference:>+10.3f} {comparison.p_value:>10.4f} {signif_str:>10}")
+
+    print("=" * 90)
+    print("Significance: *** p<0.01, ** p<0.05, * p<0.10")
+    print("=" * 90)

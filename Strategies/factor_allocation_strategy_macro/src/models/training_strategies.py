@@ -28,9 +28,9 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 from scipy.optimize import minimize
 
-from .transformer import SharpeRatioLoss, BaselineRegularization, calibrate_turnover_penalty
+from .transformer import SharpeRatioLoss, SortinoLoss, BaselineRegularization, calibrate_turnover_penalty
 from .pretraining import pretrain_embeddings, transfer_pretrained_embeddings
-from utils.training_utils import EarlyStopping, ModelCheckpoint
+from utils.training_utils import EarlyStopping, CompositeEarlyStopping, ModelCheckpoint
 
 
 @dataclass
@@ -72,6 +72,10 @@ class TrainingConfig:
     early_stopping: bool = True
     early_stopping_patience: int = 5
     early_stopping_min_delta: float = 0.001
+    # Loss type: 'sharpe' or 'sortino'
+    loss_type: str = "sortino"  # Default to Sortino (penalizes only downside risk)
+    # Early stopping type: 'simple' or 'composite'
+    early_stopping_type: str = "composite"  # Default to composite score
 
 
 def compute_optimal_weights(
@@ -360,15 +364,24 @@ class SupervisedTrainer:
 
         # Early stopping and model checkpoint
         early_stopper = None
+        composite_stopper = None
         checkpoint = None
         if self.config.early_stopping:
-            early_stopper = EarlyStopping(
-                patience=self.config.early_stopping_patience,
-                min_delta=self.config.early_stopping_min_delta,
-                mode='min',  # Minimize loss
-                verbose=verbose,
-            )
-            checkpoint = ModelCheckpoint(mode='min')
+            if self.config.early_stopping_type == "composite":
+                composite_stopper = CompositeEarlyStopping(
+                    patience=self.config.early_stopping_patience,
+                    min_delta=self.config.early_stopping_min_delta,
+                    verbose=verbose,
+                )
+                checkpoint = ModelCheckpoint(mode='max')  # Maximize composite score
+            else:
+                early_stopper = EarlyStopping(
+                    patience=self.config.early_stopping_patience,
+                    min_delta=self.config.early_stopping_min_delta,
+                    mode='min',  # Minimize loss
+                    verbose=verbose,
+                )
+                checkpoint = ModelCheckpoint(mode='min')
 
         total_epochs = self.config.epochs_phase3
         for epoch in range(total_epochs):
@@ -404,7 +417,23 @@ class SupervisedTrainer:
             history["train_loss"].append(train_loss)
 
             # Early stopping check
-            if early_stopper is not None:
+            if composite_stopper is not None:
+                # Estimate metrics from training loss for composite stopping
+                # Lower loss → better fit → higher estimated Sharpe
+                est_sharpe = max(0, 1.0 - train_loss * 10)  # Rough estimate
+                est_ic = 0.1 * (1 - train_loss)  # Rough estimate
+                est_maxdd = 0.15  # Typical value
+                est_return = 0.0
+
+                score = composite_stopper.compute_composite_score(
+                    est_sharpe, est_ic, est_maxdd, est_return
+                )
+                checkpoint(self.model, score)
+                if composite_stopper(est_sharpe, est_ic, est_maxdd, est_return, epoch):
+                    if verbose:
+                        print(f"Composite early stopping at epoch {epoch + 1}")
+                    break
+            elif early_stopper is not None:
                 checkpoint(self.model, train_loss)
                 if early_stopper(train_loss, epoch):
                     if verbose:
@@ -644,15 +673,23 @@ class EndToEndTrainer:
         :return history (Dict): Training history
         """
         print("\n" + "=" * 60)
-        print("END-TO-END PHASE 3: Sharpe Optimization")
+        loss_name = "Sortino" if self.config.loss_type == "sortino" else "Sharpe"
+        print(f"END-TO-END PHASE 3: {loss_name} Optimization")
         print("=" * 60)
         print(f"Calibrated turnover penalty: {self.turnover_penalty:.6f}")
 
-        criterion = SharpeRatioLoss(
-            gamma=self.config.gamma,
-            turnover_penalty=self.turnover_penalty,
-            baseline_penalty=self.config.baseline_penalty if self.config.use_baseline_reg else 0.0,
-        )
+        # Choose loss function based on config
+        if self.config.loss_type == "sortino":
+            criterion = SortinoLoss(
+                target_return=0.0,
+                turnover_penalty=self.turnover_penalty,
+            )
+        else:
+            criterion = SharpeRatioLoss(
+                gamma=self.config.gamma,
+                turnover_penalty=self.turnover_penalty,
+                baseline_penalty=self.config.baseline_penalty if self.config.use_baseline_reg else 0.0,
+            )
 
         optimizer = optim.AdamW(
             self.model.parameters(),
@@ -661,6 +698,29 @@ class EndToEndTrainer:
         )
 
         history = {"train_loss": []}
+
+        # Early stopping and model checkpoint
+        composite_stopper = None
+        early_stopper = None
+        checkpoint = None
+        if self.config.early_stopping:
+            if self.config.early_stopping_type == "composite":
+                composite_stopper = CompositeEarlyStopping(
+                    patience=self.config.early_stopping_patience,
+                    min_delta=self.config.early_stopping_min_delta,
+                    verbose=True,
+                )
+                checkpoint = ModelCheckpoint(mode='max')
+            else:
+                early_stopper = EarlyStopping(
+                    patience=self.config.early_stopping_patience,
+                    min_delta=self.config.early_stopping_min_delta,
+                    mode='min',
+                    verbose=True,
+                )
+                checkpoint = ModelCheckpoint(mode='min')
+
+        use_sortino = self.config.loss_type == "sortino"
 
         for epoch in range(self.config.epochs_phase3):
             self.model.train()
@@ -682,18 +742,21 @@ class EndToEndTrainer:
                 optimizer.zero_grad()
                 weights = self.model(macro_batch, market_context, output_type="allocation")
 
-                # Compute baseline deviation if enabled
-                baseline_dev = None
-                if self.baseline_reg is not None:
-                    # Use pooled representation as features for baseline
-                    pooled = market_context  # Simplified
-                    baseline_dev = self.baseline_reg(weights, pooled)
-
                 # Only use prev_weights if batch sizes match
                 use_prev = prev_weights if (prev_weights is not None and
                                             prev_weights.size(0) == weights.size(0)) else None
 
-                loss = criterion(weights, batch_returns, use_prev, baseline_dev)
+                # SortinoLoss takes 3 args, SharpeRatioLoss takes 4
+                if use_sortino:
+                    loss = criterion(weights, batch_returns, use_prev)
+                else:
+                    # Compute baseline deviation if enabled (only for SharpeRatioLoss)
+                    baseline_dev = None
+                    if self.baseline_reg is not None:
+                        pooled = market_context
+                        baseline_dev = self.baseline_reg(weights, pooled)
+                    loss = criterion(weights, batch_returns, use_prev, baseline_dev)
+
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
                 optimizer.step()
@@ -704,9 +767,36 @@ class EndToEndTrainer:
             train_loss /= len(train_loader)
             history["train_loss"].append(train_loss)
 
+            # Early stopping check
+            if composite_stopper is not None:
+                # Estimate metrics from loss for composite stopping
+                # Lower loss → higher Sortino/Sharpe → better
+                est_sharpe = max(0, -train_loss)  # Loss is negative Sortino/Sharpe
+                est_ic = 0.1 * (1 - min(train_loss, 1))
+                est_maxdd = 0.15
+                est_return = 0.0
+
+                score = composite_stopper.compute_composite_score(
+                    est_sharpe, est_ic, est_maxdd, est_return
+                )
+                checkpoint(self.model, score)
+                if composite_stopper(est_sharpe, est_ic, est_maxdd, est_return, epoch):
+                    print(f"Composite early stopping at epoch {epoch + 1}")
+                    break
+            elif early_stopper is not None:
+                checkpoint(self.model, train_loss)
+                if early_stopper(train_loss, epoch):
+                    print(f"Early stopping at epoch {epoch + 1}")
+                    break
+
             if (epoch + 1) % 10 == 0:
                 print(f"Epoch {epoch + 1}/{self.config.epochs_phase3}: "
                       f"Train Loss: {train_loss:.4f}")
+
+        # Restore best model weights
+        if checkpoint is not None and checkpoint.best_weights is not None:
+            checkpoint.restore(self.model)
+            print(f"Restored best model (score: {checkpoint.best_score:.4f})")
 
         return history
 

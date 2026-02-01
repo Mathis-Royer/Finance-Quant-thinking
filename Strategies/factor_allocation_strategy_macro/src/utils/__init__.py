@@ -41,6 +41,26 @@ from .analysis import (
     find_best_models,
     print_best_models_table,
     print_model_comparison_summary,
+    print_statistical_analysis,
+)
+from .training_utils import (
+    EarlyStopping,
+    CompositeEarlyStopping,
+    ModelCheckpoint,
+)
+from .statistics import (
+    KellyCriterionResult,
+    compute_kelly_fraction,
+    compute_kelly_weights,
+    BootstrapCI,
+    bootstrap_sharpe_ratio,
+    bootstrap_metric,
+    SharpeTestResult,
+    test_sharpe_significance,
+    SharpeComparisonResult,
+    compare_sharpe_ratios,
+    compute_all_metrics_with_ci,
+    print_metrics_summary,
 )
 
 __all__ = [
@@ -88,4 +108,22 @@ __all__ = [
     "find_best_models",
     "print_best_models_table",
     "print_model_comparison_summary",
+    "print_statistical_analysis",
+    # Training utilities
+    "EarlyStopping",
+    "CompositeEarlyStopping",
+    "ModelCheckpoint",
+    # Statistics
+    "KellyCriterionResult",
+    "compute_kelly_fraction",
+    "compute_kelly_weights",
+    "BootstrapCI",
+    "bootstrap_sharpe_ratio",
+    "bootstrap_metric",
+    "SharpeTestResult",
+    "test_sharpe_significance",
+    "SharpeComparisonResult",
+    "compare_sharpe_ratios",
+    "compute_all_metrics_with_ci",
+    "print_metrics_summary",
 ]

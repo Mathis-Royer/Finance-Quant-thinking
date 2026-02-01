@@ -22,16 +22,131 @@ import torch.nn.functional as F
 from .embeddings import TokenEncoder
 
 
+class RotaryPositionalEmbedding(nn.Module):
+    """
+    Rotary Position Embeddings (RoPE) for encoding relative positions.
+
+    RoPE encodes positions by rotating Q and K vectors, allowing the model
+    to capture relative positional information directly in attention scores.
+    This is particularly effective for time series data.
+
+    Reference: RoFormer (Su et al., 2021)
+
+    :param dim (int): Dimension of the embeddings (must be divisible by 2)
+    :param max_seq_len (int): Maximum sequence length
+    :param base (float): Base for frequency computation
+    """
+
+    def __init__(self, dim: int, max_seq_len: int = 512, base: float = 10000.0):
+        """
+        Initialize RoPE.
+
+        :param dim (int): Dimension (must be divisible by 2)
+        :param max_seq_len (int): Maximum sequence length
+        :param base (float): Base for frequency computation
+        """
+        super().__init__()
+        self.dim = dim
+        self.max_seq_len = max_seq_len
+        self.base = base
+
+        # Precompute frequency bands
+        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
+        self.register_buffer("inv_freq", inv_freq)
+
+        # Precompute sin/cos for all positions
+        self._precompute_cache(max_seq_len)
+
+    def _precompute_cache(self, seq_len: int) -> None:
+        """
+        Precompute sin/cos cache for efficiency.
+
+        :param seq_len (int): Sequence length to cache
+        """
+        positions = torch.arange(seq_len, dtype=torch.float32)
+        freqs = torch.outer(positions, self.inv_freq)
+
+        # Cache sin and cos
+        self.register_buffer("cos_cached", freqs.cos(), persistent=False)
+        self.register_buffer("sin_cached", freqs.sin(), persistent=False)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        positions: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Apply rotary embeddings to input tensor.
+
+        :param x (torch.Tensor): Input [batch, seq, heads, head_dim]
+        :param positions (Optional[torch.Tensor]): Custom positions [batch, seq] (for temporal data)
+
+        :return rotated (torch.Tensor): Rotated embeddings
+        """
+        batch_size, seq_len, num_heads, head_dim = x.shape
+
+        # Use precomputed cache or compute on-the-fly
+        if positions is None:
+            # Standard sequential positions: [seq_len, dim//2]
+            cos = self.cos_cached[:seq_len]
+            sin = self.sin_cached[:seq_len]
+            # Expand to [1, seq_len, 1, dim//2] for broadcasting
+            cos = cos.unsqueeze(0).unsqueeze(2)
+            sin = sin.unsqueeze(0).unsqueeze(2)
+        else:
+            # Custom positions (e.g., days offset for temporal data)
+            # positions: [batch, seq] -> clamp to valid range
+            positions = positions.clamp(0, self.max_seq_len - 1).long()
+            # Index into cached values: [batch, seq, dim//2]
+            cos = self.cos_cached[positions]
+            sin = self.sin_cached[positions]
+            # Expand to [batch, seq, 1, dim//2] for broadcasting with heads
+            cos = cos.unsqueeze(2)
+            sin = sin.unsqueeze(2)
+
+        return self._apply_rotary(x, cos, sin)
+
+    def _apply_rotary(
+        self,
+        x: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Apply rotary transformation.
+
+        :param x (torch.Tensor): Input tensor [batch, seq, heads, head_dim]
+        :param cos (torch.Tensor): Cosine values [batch/1, seq, 1, dim//2]
+        :param sin (torch.Tensor): Sine values [batch/1, seq, 1, dim//2]
+
+        :return rotated (torch.Tensor): Rotated tensor
+        """
+        # Split head_dim into pairs for rotation
+        half_dim = x.shape[-1] // 2
+        x1, x2 = x[..., :half_dim], x[..., half_dim:]
+
+        # Apply rotation: [cos(θ), -sin(θ); sin(θ), cos(θ)] @ [x1; x2]
+        rotated = torch.cat([
+            x1 * cos - x2 * sin,
+            x2 * cos + x1 * sin,
+        ], dim=-1)
+
+        return rotated
+
+
 class MultiHeadAttention(nn.Module):
     """
-    Multi-head self-attention with causal masking.
+    Multi-head self-attention with causal masking and optional RoPE.
 
-    Includes optional soft temporal decay for attention weights.
+    Includes optional soft temporal decay for attention weights and
+    Rotary Position Embeddings (RoPE) for relative position encoding.
 
     :param d_model (int): Model dimension
     :param num_heads (int): Number of attention heads
     :param dropout (float): Dropout probability
     :param use_temporal_decay (bool): Apply soft temporal decay to attention
+    :param use_rope (bool): Use Rotary Position Embeddings
+    :param max_seq_len (int): Maximum sequence length for RoPE
     """
 
     def __init__(
@@ -40,6 +155,8 @@ class MultiHeadAttention(nn.Module):
         num_heads: int,
         dropout: float = 0.6,
         use_temporal_decay: bool = True,
+        use_rope: bool = True,
+        max_seq_len: int = 512,
     ):
         """
         Initialize attention layer.
@@ -48,6 +165,8 @@ class MultiHeadAttention(nn.Module):
         :param num_heads (int): Number of attention heads
         :param dropout (float): Dropout probability
         :param use_temporal_decay (bool): Use temporal decay
+        :param use_rope (bool): Use Rotary Position Embeddings
+        :param max_seq_len (int): Maximum sequence length for RoPE
         """
         super().__init__()
         assert d_model % num_heads == 0
@@ -56,6 +175,7 @@ class MultiHeadAttention(nn.Module):
         self.num_heads = num_heads
         self.head_dim = d_model // num_heads
         self.use_temporal_decay = use_temporal_decay
+        self.use_rope = use_rope
 
         self.q_proj = nn.Linear(d_model, d_model)
         self.k_proj = nn.Linear(d_model, d_model)
@@ -68,6 +188,13 @@ class MultiHeadAttention(nn.Module):
         if use_temporal_decay:
             self.decay_rate = nn.Parameter(torch.tensor(0.1))
 
+        # Rotary Position Embeddings
+        if use_rope:
+            self.rotary_emb = RotaryPositionalEmbedding(
+                dim=self.head_dim,
+                max_seq_len=max_seq_len,
+            )
+
     def forward(
         self,
         x: torch.Tensor,
@@ -75,11 +202,11 @@ class MultiHeadAttention(nn.Module):
         days_offset: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
-        Compute multi-head attention.
+        Compute multi-head attention with optional RoPE.
 
         :param x (torch.Tensor): Input [batch, seq, d_model]
         :param mask (Optional[torch.Tensor]): Attention mask [batch, seq, seq]
-        :param days_offset (Optional[torch.Tensor]): Days offset for decay [batch, seq]
+        :param days_offset (Optional[torch.Tensor]): Days offset for RoPE/decay [batch, seq]
 
         :return output (torch.Tensor): Output [batch, seq, d_model]
         """
@@ -89,6 +216,13 @@ class MultiHeadAttention(nn.Module):
         q = self.q_proj(x).view(batch_size, seq_len, self.num_heads, self.head_dim)
         k = self.k_proj(x).view(batch_size, seq_len, self.num_heads, self.head_dim)
         v = self.v_proj(x).view(batch_size, seq_len, self.num_heads, self.head_dim)
+
+        # Apply RoPE to Q and K before transposing
+        if self.use_rope:
+            # Use days_offset as positions if available (for temporal data)
+            positions = days_offset.abs() if days_offset is not None else None
+            q = self.rotary_emb(q, positions)
+            k = self.rotary_emb(k, positions)
 
         # Transpose for attention: [batch, heads, seq, head_dim]
         q = q.transpose(1, 2)
@@ -144,11 +278,13 @@ class TransformerBlock(nn.Module):
     Single Transformer block with attention and feedforward.
 
     Includes skip connections (residual) for learning linear relationships.
+    Uses Pre-LN architecture (LayerNorm before attention/FFN).
 
     :param d_model (int): Model dimension
     :param num_heads (int): Number of attention heads
     :param d_ff (int): Feedforward dimension
     :param dropout (float): Dropout probability
+    :param use_rope (bool): Use Rotary Position Embeddings
     """
 
     def __init__(
@@ -157,6 +293,7 @@ class TransformerBlock(nn.Module):
         num_heads: int,
         d_ff: int,
         dropout: float = 0.6,
+        use_rope: bool = True,
     ):
         """
         Initialize Transformer block.
@@ -165,10 +302,13 @@ class TransformerBlock(nn.Module):
         :param num_heads (int): Number of attention heads
         :param d_ff (int): Feedforward dimension
         :param dropout (float): Dropout probability
+        :param use_rope (bool): Use Rotary Position Embeddings
         """
         super().__init__()
 
-        self.attention = MultiHeadAttention(d_model, num_heads, dropout)
+        self.attention = MultiHeadAttention(
+            d_model, num_heads, dropout, use_rope=use_rope
+        )
         self.norm1 = nn.LayerNorm(d_model)
         self.norm2 = nn.LayerNorm(d_model)
 
@@ -212,7 +352,7 @@ class FactorAllocationTransformer(nn.Module):
 
     Architecture:
     1. Token encoding (macro + market context)
-    2. Transformer blocks with causal attention
+    2. Transformer blocks with causal attention + RoPE
     3. Pooling (mean or CLS token)
     4. Output head for allocation weights
 
@@ -224,6 +364,7 @@ class FactorAllocationTransformer(nn.Module):
     :param d_ff (int): Feedforward dimension
     :param dropout (float): Dropout probability
     :param max_seq_len (int): Maximum sequence length
+    :param use_rope (bool): Use Rotary Position Embeddings
     """
 
     def __init__(
@@ -236,6 +377,7 @@ class FactorAllocationTransformer(nn.Module):
         d_ff: int = 64,
         dropout: float = 0.6,
         max_seq_len: int = 100,
+        use_rope: bool = True,
     ):
         """
         Initialize the Transformer model.
@@ -248,6 +390,7 @@ class FactorAllocationTransformer(nn.Module):
         :param d_ff (int): Feedforward dimension
         :param dropout (float): Dropout probability
         :param max_seq_len (int): Maximum sequence length
+        :param use_rope (bool): Use Rotary Position Embeddings
         """
         super().__init__()
 
@@ -261,9 +404,9 @@ class FactorAllocationTransformer(nn.Module):
             dropout=dropout,
         )
 
-        # Transformer blocks
+        # Transformer blocks with RoPE
         self.layers = nn.ModuleList([
-            TransformerBlock(d_model, num_heads, d_ff, dropout)
+            TransformerBlock(d_model, num_heads, d_ff, dropout, use_rope=use_rope)
             for _ in range(num_layers)
         ])
 
@@ -564,6 +707,115 @@ class SharpeRatioLoss(nn.Module):
         # Baseline regularization
         if baseline_deviation is not None and self.baseline_penalty > 0:
             loss = loss + self.baseline_penalty * baseline_deviation
+
+        return loss
+
+
+class SortinoLoss(nn.Module):
+    """
+    Differentiable Sortino ratio loss - penalizes only downside volatility.
+
+    The Sortino ratio is similar to Sharpe but uses downside deviation
+    (std of negative returns) instead of total volatility. This is more
+    appropriate for investment strategies where upside volatility is desirable.
+
+    Loss = -mean(R) / downside_std + lambda * turnover
+
+    :param target_return (float): Target return for downside calculation (default 0)
+    :param turnover_penalty (float): Turnover penalty coefficient
+    :param use_running_stats (bool): Use running downside std for stable gradients
+    :param momentum (float): Momentum for running stats update
+    :param min_downside_samples (int): Minimum negative samples for valid std
+    """
+
+    def __init__(
+        self,
+        target_return: float = 0.0,
+        turnover_penalty: float = 0.01,
+        use_running_stats: bool = True,
+        momentum: float = 0.99,
+        min_downside_samples: int = 5,
+    ):
+        """
+        Initialize Sortino loss.
+
+        :param target_return (float): Target return threshold (typically 0 or risk-free rate)
+        :param turnover_penalty (float): Penalty for weight changes
+        :param use_running_stats (bool): Use running downside std for stable gradients
+        :param momentum (float): Momentum for running stats update
+        :param min_downside_samples (int): Minimum downside samples for valid std
+        """
+        super().__init__()
+        self.target_return = target_return
+        self.turnover_penalty = turnover_penalty
+        self.use_running_stats = use_running_stats
+        self.momentum = momentum
+        self.min_downside_samples = min_downside_samples
+        # Running downside std buffer for stable gradients
+        self.register_buffer('running_downside_std', torch.tensor(0.01))
+
+    def forward(
+        self,
+        weights: torch.Tensor,
+        returns: torch.Tensor,
+        prev_weights: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Compute Sortino ratio loss.
+
+        :param weights (torch.Tensor): Predicted weights [batch, num_factors]
+        :param returns (torch.Tensor): Factor returns [batch, num_factors]
+        :param prev_weights (Optional[torch.Tensor]): Previous weights for turnover
+
+        :return loss (torch.Tensor): Scalar loss
+        """
+        # Portfolio return
+        portfolio_return = (weights * returns).sum(dim=-1)
+
+        # Mean return
+        mean_return = portfolio_return.mean()
+
+        # Downside deviation: std of returns below target
+        downside_returns = portfolio_return - self.target_return
+        downside_mask = downside_returns < 0
+
+        # Count downside samples
+        n_downside = downside_mask.sum()
+
+        if n_downside >= self.min_downside_samples:
+            # Compute downside std using only negative returns
+            downside_squared = (downside_returns * downside_mask.float()).pow(2)
+            downside_variance = downside_squared.sum() / n_downside
+            batch_downside_std = torch.sqrt(downside_variance + 1e-8)
+        else:
+            # Fallback to regular std if not enough downside samples
+            batch_downside_std = portfolio_return.std() + 1e-8
+
+        # Update running downside std (only in training mode)
+        if self.training and self.use_running_stats:
+            with torch.no_grad():
+                self.running_downside_std = (
+                    self.momentum * self.running_downside_std
+                    + (1 - self.momentum) * batch_downside_std
+                )
+
+        # Use running downside std for stable gradients
+        downside_std = (
+            self.running_downside_std + 1e-8
+            if self.use_running_stats
+            else batch_downside_std
+        )
+
+        # Sortino ratio (annualized: sqrt(12) for monthly data)
+        sortino_ratio = mean_return / downside_std * 3.464  # sqrt(12) = 3.464
+
+        # Base loss: negative Sortino (minimize loss = maximize Sortino)
+        loss = -sortino_ratio
+
+        # Turnover penalty
+        if prev_weights is not None:
+            turnover = torch.abs(weights - prev_weights).sum(dim=-1).mean()
+            loss = loss + self.turnover_penalty * turnover
 
         return loss
 

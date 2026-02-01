@@ -255,7 +255,7 @@ def plot_final_vs_ensemble_scatter(
     config_filter: Optional[str] = "baseline",
 ) -> Figure:
     """
-    Plot scatter comparing Final vs Ensemble Sharpe.
+    Plot scatter comparing Final vs Ensemble Score.
 
     Points above diagonal = Ensemble better, below = Final better.
 
@@ -279,10 +279,12 @@ def plot_final_vs_ensemble_scatter(
         fair_ens = results.get('fair_ensemble')
 
         if final and fair_ens:
+            final_score = _compute_score(final.sharpe, final.ic, final.maxdd, final.total_return)
+            fair_score = _compute_score(fair_ens.sharpe, fair_ens.ic, fair_ens.maxdd, fair_ens.total_return)
             paired_data.append({
                 'combo': f"{strategy}-{allocation[:1]}-{horizon}M",
-                'final': final.sharpe,
-                'fair_ensemble': fair_ens.sharpe,
+                'final': final_score,
+                'fair_ensemble': fair_score,
             })
 
     if not paired_data:
@@ -304,8 +306,8 @@ def plot_final_vs_ensemble_scatter(
         )
 
     lims = [
-        min(min(final_vals), min(fair_vals)) - 0.2,
-        max(max(final_vals), max(fair_vals)) + 0.2
+        min(min(final_vals), min(fair_vals)) - 0.02,
+        max(max(final_vals), max(fair_vals)) + 0.02
     ]
     ax.plot(lims, lims, 'k--', alpha=0.5, label='Final = Fair Ens.')
     ax.fill_between(
@@ -317,13 +319,15 @@ def plot_final_vs_ensemble_scatter(
         alpha=0.1, color='blue', label='Final > Fair Ens.'
     )
 
-    ax.set_xlabel('Final Model Sharpe')
-    ax.set_ylabel('Fair Ensemble Sharpe')
-    ax.set_title(f'Final vs Fair Ensemble: Holdout Sharpe (Fair Comparison){config_suffix}')
+    ax.set_xlabel('Final Model Score')
+    ax.set_ylabel('Fair Ensemble Score')
+    ax.set_title(f'Final vs Fair Ensemble: Holdout Score (Fair Comparison){config_suffix}')
     ax.legend(loc='lower right')
     ax.grid(True, alpha=0.3)
     ax.set_xlim(lims)
     ax.set_ylim(lims)
+    ax.xaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: f"{x:.1%}"))
+    ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: f"{x:.1%}"))
 
     plt.tight_layout()
     return fig
@@ -526,6 +530,65 @@ def plot_sharpe_heatmaps_by_model_type(
     return fig
 
 
+def _compute_score(
+    sharpe: float,
+    ic: float,
+    maxdd: float,
+    total_return: float,
+    reject_negative_ic_threshold: float = -0.3,
+) -> float:
+    """
+    Compute composite score for a single model result.
+
+    Uses the same formula as compute_composite_score in comparison_runner.py:
+    - Sharpe: linear normalization with fixed bounds [-0.5, 1.5]
+    - IC: asymmetric penalty (positive contributes, negative penalizes 2x)
+    - MaxDD: exponential penalty via exp(3 * maxdd)
+    - Return: binary bonus (1 if positive, 0 otherwise)
+    - Models with IC < -0.3 are rejected (score = 0)
+
+    :param sharpe: Sharpe ratio
+    :param ic: Information Coefficient
+    :param maxdd: Maximum drawdown (negative value)
+    :param total_return: Total return
+    :param reject_negative_ic_threshold: IC below this threshold = score 0
+
+    :return score: Composite score (higher is better, in [0, 1])
+    """
+    weights = {'sharpe': 0.35, 'ic': 0.25, 'maxdd': 0.30, 'return': 0.10}
+    sharpe_min, sharpe_max = -0.5, 1.5
+
+    # 1. Reject if IC very negative (inverted predictions)
+    if ic < reject_negative_ic_threshold:
+        return 0.0
+
+    # 2. Sharpe normalization [0, 1]
+    sharpe_norm = np.clip((sharpe - sharpe_min) / (sharpe_max - sharpe_min), 0, 1)
+
+    # 3. IC with asymmetric penalty (saturates at 100%, not 50%)
+    if ic >= 0:
+        ic_score = np.clip(ic, 0, 1)  # Positive IC: [0, 1.0] -> [0, 1]
+        ic_penalty = 0.0
+    else:
+        ic_score = 0.0  # Negative IC contributes nothing positive
+        ic_penalty = 2 * np.clip(-ic, 0, 1)  # Double penalty
+
+    # 4. MaxDD with exponential penalty
+    # -5% -> 0.86, -10% -> 0.74, -15% -> 0.64, -20% -> 0.55
+    maxdd_score = np.exp(3 * maxdd)  # maxdd is negative
+
+    # 5. Final score
+    score = (
+        weights['sharpe'] * sharpe_norm
+        + weights['ic'] * ic_score
+        + weights['maxdd'] * maxdd_score
+        + weights['return'] * (1 if total_return > 0 else 0)
+        - 0.15 * ic_penalty  # Explicit penalty for negative IC
+    )
+
+    return np.clip(score, 0, 1)
+
+
 def plot_winner_distribution(
     all_holdout_results: HoldoutResults,
     figsize: Tuple[int, int] = (14, 5),
@@ -534,7 +597,9 @@ def plot_winner_distribution(
     config_filter: Optional[str] = "baseline",
 ) -> Figure:
     """
-    Plot winner distribution and average Sharpe by model type.
+    Plot winner distribution (by Score) and average Sharpe by model type.
+
+    Winner is determined by composite Score (not Sharpe).
 
     :param all_holdout_results (HoldoutResults): Holdout results dict
     :param figsize (Tuple[int, int]): Figure size
@@ -548,7 +613,7 @@ def plot_winner_distribution(
     config_suffix = f" [{config_filter}]" if config_filter else ""
 
     fig, axes = plt.subplots(1, 2, figsize=figsize)
-    fig.suptitle(f"Winner Distribution{config_suffix}", fontsize=14, fontweight='bold')
+    fig.suptitle(f"Winner Distribution (by Score){config_suffix}", fontsize=14, fontweight='bold')
 
     final_wins = 0
     ensemble_wins = 0
@@ -571,9 +636,12 @@ def plot_winner_distribution(
         final_sharpes.append(final.sharpe)
         if fair_ensemble:
             fair_ensemble_sharpes.append(fair_ensemble.sharpe)
-            if final.sharpe > fair_ensemble.sharpe:
+            # Compute scores for winner determination
+            final_score = _compute_score(final.sharpe, final.ic, final.maxdd, final.total_return)
+            fair_score = _compute_score(fair_ensemble.sharpe, fair_ensemble.ic, fair_ensemble.maxdd, fair_ensemble.total_return)
+            if final_score > fair_score:
                 final_wins += 1
-            elif fair_ensemble.sharpe > final.sharpe:
+            elif fair_score > final_score:
                 ensemble_wins += 1
             else:
                 ties += 1
@@ -592,7 +660,7 @@ def plot_winner_distribution(
             colors=['steelblue', 'coral', 'gray'],
             startangle=90
         )
-        ax1.set_title('Winner Distribution (Final vs Fair Ensemble)')
+        ax1.set_title('Winner Distribution by Score (Final vs Fair Ensemble)')
     else:
         ax1.text(
             0.5, 0.5, 'No Fair Ensemble\n(WF Ensemble only)',
@@ -795,30 +863,40 @@ def plot_top_models_cumulative(
             label += f"-{config}"
 
         if results.get('final'):
+            r = results['final']
+            score = _compute_score(r.sharpe, r.ic, r.maxdd, r.total_return)
             final_data.append({
                 'key': key,
                 'label': label + "-F",
-                'sharpe': results['final'].sharpe,
-                'returns': results['final'].monthly_returns,
+                'sharpe': r.sharpe,
+                'score': score,
+                'returns': r.monthly_returns,
             })
         if results.get('fair_ensemble'):
+            r = results['fair_ensemble']
+            score = _compute_score(r.sharpe, r.ic, r.maxdd, r.total_return)
             fair_data.append({
                 'key': key,
                 'label': label + "-FE",
-                'sharpe': results['fair_ensemble'].sharpe,
-                'returns': results['fair_ensemble'].monthly_returns,
+                'sharpe': r.sharpe,
+                'score': score,
+                'returns': r.monthly_returns,
             })
         if results.get('wf_ensemble'):
+            r = results['wf_ensemble']
+            score = _compute_score(r.sharpe, r.ic, r.maxdd, r.total_return)
             wf_data.append({
                 'key': key,
                 'label': label + "-WF",
-                'sharpe': results['wf_ensemble'].sharpe,
-                'returns': results['wf_ensemble'].monthly_returns,
+                'sharpe': r.sharpe,
+                'score': score,
+                'returns': r.monthly_returns,
             })
 
-    final_data.sort(key=lambda x: x['sharpe'], reverse=True)
-    fair_data.sort(key=lambda x: x['sharpe'], reverse=True)
-    wf_data.sort(key=lambda x: x['sharpe'], reverse=True)
+    # Sort by composite score (not Sharpe) for fairer multi-metric ranking
+    final_data.sort(key=lambda x: x['score'], reverse=True)
+    fair_data.sort(key=lambda x: x['score'], reverse=True)
+    wf_data.sort(key=lambda x: x['score'], reverse=True)
 
     # Final models (solid lines)
     for d in final_data[:top_n]:
@@ -827,7 +905,7 @@ def plot_top_models_cumulative(
             ax.plot(
                 range(len(cum_ret)), cum_ret,
                 linewidth=2.5, linestyle='-',
-                label=f"{d['label']} (Sharpe={d['sharpe']:.2f})"
+                label=f"{d['label']} (Score={d['score']*100:.1f}%)"
             )
 
     # Fair Ensemble models (dashed lines)
@@ -837,7 +915,7 @@ def plot_top_models_cumulative(
             ax.plot(
                 range(len(cum_ret)), cum_ret,
                 linewidth=2.5, linestyle='--',
-                label=f"{d['label']} (Sharpe={d['sharpe']:.2f})"
+                label=f"{d['label']} (Score={d['score']*100:.1f}%)"
             )
 
     # WF Ensemble models (dotted lines)
@@ -847,7 +925,7 @@ def plot_top_models_cumulative(
             ax.plot(
                 range(len(cum_ret)), cum_ret,
                 linewidth=2, linestyle=':',
-                label=f"{d['label']} (Sharpe={d['sharpe']:.2f})"
+                label=f"{d['label']} (Score={d['score']*100:.1f}%)"
             )
 
     ax.axhline(y=1, color='black', linestyle=':', linewidth=1)
@@ -898,28 +976,38 @@ def plot_top_models_with_benchmarks(
             label += f"-{config}"
 
         if results.get('final'):
+            r = results['final']
+            score = _compute_score(r.sharpe, r.ic, r.maxdd, r.total_return)
             all_models.append({
                 'label': label + "-F",
-                'sharpe': results['final'].sharpe,
-                'returns': results['final'].monthly_returns,
+                'sharpe': r.sharpe,
+                'score': score,
+                'returns': r.monthly_returns,
                 'type': 'Final',
             })
         if results.get('fair_ensemble'):
+            r = results['fair_ensemble']
+            score = _compute_score(r.sharpe, r.ic, r.maxdd, r.total_return)
             all_models.append({
                 'label': label + "-FE",
-                'sharpe': results['fair_ensemble'].sharpe,
-                'returns': results['fair_ensemble'].monthly_returns,
+                'sharpe': r.sharpe,
+                'score': score,
+                'returns': r.monthly_returns,
                 'type': 'Fair Ensemble',
             })
         if results.get('wf_ensemble'):
+            r = results['wf_ensemble']
+            score = _compute_score(r.sharpe, r.ic, r.maxdd, r.total_return)
             all_models.append({
                 'label': label + "-WF",
-                'sharpe': results['wf_ensemble'].sharpe,
-                'returns': results['wf_ensemble'].monthly_returns,
+                'sharpe': r.sharpe,
+                'score': score,
+                'returns': r.monthly_returns,
                 'type': 'WF Ensemble',
             })
 
-    all_models.sort(key=lambda x: x['sharpe'], reverse=True)
+    # Sort by composite score (not Sharpe) for fairer multi-metric ranking
+    all_models.sort(key=lambda x: x['score'], reverse=True)
 
     # Colors for top models (solid lines)
     model_colors = ['#1f77b4', '#ff7f0e', '#2ca02c']  # Blue, Orange, Green
@@ -929,7 +1017,7 @@ def plot_top_models_with_benchmarks(
             ax.plot(
                 range(len(cum_ret)), cum_ret,
                 linewidth=2.5, linestyle='-', color=model_colors[i % len(model_colors)],
-                label=f"{d['label']} (Sharpe={d['sharpe']:.2f})"
+                label=f"{d['label']} (Score={d['score']*100:.1f}%)"
             )
 
     if benchmarks:

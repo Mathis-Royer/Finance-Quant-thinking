@@ -27,6 +27,11 @@ from utils.constants import (
     ALLOCATION_ABBREV,
 )
 from visualization.colormaps import CONFIG_COLORS
+from utils.statistics import (
+    bootstrap_sharpe_ratio,
+    test_sharpe_significance,
+    compare_sharpe_ratios,
+)
 
 # Page configuration
 st.set_page_config(
@@ -463,6 +468,7 @@ def render_sharpe_bar_chart(df: pd.DataFrame, benchmarks_df: pd.DataFrame = None
     ax.set_yticks(range(len(sorted_df)))
     ax.set_yticklabels(labels, fontsize=8)
     ax.axvline(x=0, color="black", linewidth=0.8)
+    ax.axvline(x=1, color="#1976d2", linewidth=1.5, linestyle=":", alpha=0.7, label="Sharpe = 1")
 
     # Add best benchmark reference line
     if benchmarks_df is not None and len(benchmarks_df) > 0:
@@ -471,8 +477,8 @@ def render_sharpe_bar_chart(df: pd.DataFrame, benchmarks_df: pd.DataFrame = None
             x=best_bm["sharpe"], color="#9467bd", linewidth=2, linestyle="--",
             label=f"Best Benchmark: {best_bm['name']} ({best_bm['sharpe']:.2f})"
         )
-        ax.legend(loc="lower right", fontsize=9)
 
+    ax.legend(loc="lower right", fontsize=9)
     ax.set_xlabel("Sharpe Ratio")
     ax.set_title("Holdout Sharpe Ratio by Model", fontweight="bold")
     ax.grid(True, alpha=0.3, axis="x")
@@ -572,6 +578,8 @@ def render_model_type_comparison(df: pd.DataFrame, benchmarks_df: pd.DataFrame =
         ax.grid(True, alpha=0.3, axis="y")
         if metric == "sharpe":
             ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: f"{x:.2f}"))
+            # Add Sharpe=1 reference line
+            ax.axhline(y=1, color="#1976d2", linewidth=1.5, linestyle=":", alpha=0.7, label="Sharpe = 1")
         else:
             ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: f"{x:.0f}%"))
 
@@ -589,6 +597,11 @@ def render_model_type_comparison(df: pd.DataFrame, benchmarks_df: pd.DataFrame =
                     y=bm_val, color="#9467bd", linewidth=2, linestyle="--",
                     label=f"Best Benchmark: {bm_val:.0f}%"
                 )
+
+        # Show legend for Sharpe (has Sharpe=1 and possibly benchmark)
+        if metric == "sharpe":
+            ax.legend(loc="upper right", fontsize=8)
+        elif metric in best_bm_values and metric != "ic":
             ax.legend(loc="upper right", fontsize=8)
 
         # Add value labels
@@ -858,6 +871,8 @@ def render_config_comparison(df: pd.DataFrame):
 
         if metric == "sharpe":
             ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: f"{x:.2f}"))
+            # Add Sharpe=1 reference line
+            ax.axhline(y=1, color="#1976d2", linewidth=1.5, linestyle=":", alpha=0.7, label="Sharpe = 1")
         else:
             ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: f"{x:.0f}%"))
 
@@ -875,6 +890,11 @@ def render_config_comparison(df: pd.DataFrame):
                     y=bm_val, color="gray", linewidth=2, linestyle="--",
                     label=f"Baseline: {bm_val:.0f}%"
                 )
+
+        # Show legend for Sharpe (has Sharpe=1 and possibly baseline)
+        if metric == "sharpe":
+            ax.legend(loc="upper right", fontsize=8)
+        elif metric in baseline_values:
             ax.legend(loc="upper right", fontsize=8)
 
         # Add value labels
@@ -981,6 +1001,258 @@ def render_benchmarks_comparison(df: pd.DataFrame, benchmarks_df: pd.DataFrame):
 
 
 # ============================================================
+# STATISTICAL ANALYSIS
+# ============================================================
+
+def render_statistical_analysis(df: pd.DataFrame, benchmarks_df: pd.DataFrame = None, top_n: int = 3):
+    """
+    Render statistical analysis with bootstrap CIs and significance tests.
+
+    :param df (pd.DataFrame): DataFrame with monthly_returns column
+    :param benchmarks_df (pd.DataFrame): Benchmarks DataFrame with monthly_returns
+    :param top_n (int): Number of top models to analyze
+    """
+    if len(df) == 0:
+        st.warning("No data available for statistical analysis.")
+        return
+
+    # Check if monthly_returns column exists
+    if "monthly_returns" not in df.columns:
+        st.info("Monthly returns data not available. Re-export results from notebook to enable statistical analysis.")
+        return
+
+    # Get top N models by Score
+    top_models = df.nlargest(top_n, "score").copy()
+
+    # Filter models that have monthly returns data
+    top_models = top_models[top_models["monthly_returns"].str.len() > 0]
+
+    if len(top_models) == 0:
+        st.info("No monthly returns data available for top models.")
+        return
+
+    # Create labels
+    type_abbrev = MODEL_TYPE_ABBREV
+    config_abbrev = CONFIG_SUFFIX
+    has_multi_configs = "config" in top_models.columns and top_models["config"].nunique() > 1
+
+    # Parameters
+    col1, col2 = st.columns(2)
+    with col1:
+        n_bootstrap = st.slider("Bootstrap samples", 100, 5000, 1000, 100)
+    with col2:
+        confidence_level = st.selectbox("Confidence level", [0.90, 0.95, 0.99], index=1)
+
+    # Parse returns and compute statistics
+    results = []
+    model_returns_dict = {}
+
+    for _, row in top_models.iterrows():
+        returns_str = row["monthly_returns"]
+        if not returns_str:
+            continue
+
+        try:
+            returns = np.array([float(r) for r in returns_str.split(",")])
+        except (ValueError, AttributeError):
+            continue
+
+        if len(returns) == 0:
+            continue
+
+        config_suffix = config_abbrev.get(row.get('config', 'baseline'), '') if has_multi_configs else ''
+        label = f"{row['strategy']}-{row['allocation'][0]}-{row['horizon']}M{config_suffix}-{type_abbrev.get(row['model_type'], '?')}"
+
+        model_returns_dict[label] = returns
+
+        # Bootstrap CI
+        ci = bootstrap_sharpe_ratio(
+            returns,
+            n_bootstrap=n_bootstrap,
+            confidence_level=confidence_level,
+        )
+
+        # Significance test (H0: Sharpe = 0)
+        sig = test_sharpe_significance(returns, alpha=1 - confidence_level)
+
+        results.append({
+            "Model": label,
+            "Sharpe": ci.estimate,
+            "CI Lower": ci.ci_lower,
+            "CI Upper": ci.ci_upper,
+            "Std Error": ci.std_error,
+            "p-value": sig.p_value,
+            "Significant": "Yes" if sig.is_significant else "No",
+        })
+
+    if not results:
+        st.info("Could not compute statistics for any models.")
+        return
+
+    # Display results table
+    st.markdown("### Bootstrap Confidence Intervals & Significance Tests")
+    st.markdown(f"**Bootstrap samples**: {n_bootstrap} | **Confidence level**: {confidence_level:.0%}")
+
+    results_df = pd.DataFrame(results)
+
+    # Format for display
+    styled_df = results_df.style.format({
+        "Sharpe": "{:+.3f}",
+        "CI Lower": "{:+.3f}",
+        "CI Upper": "{:+.3f}",
+        "Std Error": "{:.3f}",
+        "p-value": "{:.4f}",
+    }).apply(
+        lambda x: ['background-color: #d4edda; color: black' if v == "Yes" else 'background-color: #f8d7da; color: black' if v == "No" else '' for v in x],
+        subset=["Significant"]
+    )
+
+    st.dataframe(styled_df, use_container_width=True, hide_index=True)
+
+    # Interpretation
+    st.markdown("---")
+    st.markdown("#### Interpretation")
+
+    significant_models = results_df[results_df["Significant"] == "Yes"]
+    if len(significant_models) > 0:
+        st.success(
+            f"**{len(significant_models)}/{len(results_df)}** models have statistically significant Sharpe ratios "
+            f"(p < {1-confidence_level:.2f}). We can reject the null hypothesis that Sharpe = 0."
+        )
+    else:
+        st.warning(
+            "No models have statistically significant Sharpe ratios at the current confidence level. "
+            "The results could be due to chance."
+        )
+
+    # Best benchmark comparison
+    if benchmarks_df is not None and "monthly_returns" in benchmarks_df.columns:
+        # Find best benchmark by Sharpe
+        best_bm = benchmarks_df.loc[benchmarks_df["sharpe"].idxmax()]
+        bm_returns_str = best_bm.get("monthly_returns", "")
+
+        if bm_returns_str and len(bm_returns_str) > 0:
+            try:
+                bm_returns = np.array([float(r) for r in bm_returns_str.split(",")])
+
+                if len(bm_returns) > 0:
+                    st.markdown("---")
+                    st.markdown(f"### Comparison vs Best Benchmark ({best_bm['name']})")
+
+                    # Compute benchmark Sharpe CI
+                    bm_ci = bootstrap_sharpe_ratio(bm_returns, n_bootstrap=n_bootstrap)
+                    st.markdown(f"**Benchmark Sharpe**: {bm_ci.estimate:+.3f} (95% CI: [{bm_ci.ci_lower:+.3f}, {bm_ci.ci_upper:+.3f}])")
+
+                    comparison_results = []
+                    for label, returns in model_returns_dict.items():
+                        # Truncate to same length
+                        min_len = min(len(returns), len(bm_returns))
+                        comparison = compare_sharpe_ratios(
+                            returns[:min_len],
+                            bm_returns[:min_len],
+                            alpha=1 - confidence_level,
+                        )
+
+                        comparison_results.append({
+                            "Model": label,
+                            "Model Sharpe": comparison.sharpe_1,
+                            "Benchmark Sharpe": comparison.sharpe_2,
+                            "Delta": comparison.difference,
+                            "p-value": comparison.p_value,
+                            "Significant": "Yes" if comparison.is_significant else "No",
+                        })
+
+                    comp_df = pd.DataFrame(comparison_results)
+                    styled_comp = comp_df.style.format({
+                        "Model Sharpe": "{:+.3f}",
+                        "Benchmark Sharpe": "{:+.3f}",
+                        "Delta": "{:+.3f}",
+                        "p-value": "{:.4f}",
+                    }).apply(
+                        lambda x: ['background-color: #d4edda; color: black' if v == "Yes" else 'color: black' for v in x],
+                        subset=["Significant"]
+                    )
+
+                    st.dataframe(styled_comp, use_container_width=True, hide_index=True)
+
+                    # Interpretation
+                    sig_vs_bm = comp_df[comp_df["Significant"] == "Yes"]
+                    if len(sig_vs_bm) > 0:
+                        better = sig_vs_bm[sig_vs_bm["Delta"] > 0]
+                        worse = sig_vs_bm[sig_vs_bm["Delta"] < 0]
+                        if len(better) > 0:
+                            st.success(f"**{len(better)}** model(s) significantly outperform the benchmark (Jobson-Korkie test).")
+                        if len(worse) > 0:
+                            st.warning(f"**{len(worse)}** model(s) significantly underperform the benchmark.")
+                    else:
+                        st.info("No significant difference between models and benchmark at current confidence level.")
+
+            except (ValueError, AttributeError):
+                pass
+
+    # Visual: Forest plot
+    st.markdown("---")
+    st.markdown("### Forest Plot: Sharpe Ratio with Confidence Intervals")
+
+    fig, ax = plt.subplots(figsize=(10, max(4, len(results) * 0.8)))
+
+    y_positions = range(len(results))
+    for i, res in enumerate(results):
+        color = "#2ca02c" if res["Significant"] == "Yes" else "#d62728"
+        ax.errorbar(
+            res["Sharpe"], i,
+            xerr=[[res["Sharpe"] - res["CI Lower"]], [res["CI Upper"] - res["Sharpe"]]],
+            fmt='o', color=color, capsize=5, capthick=2, markersize=8
+        )
+
+    ax.axvline(x=0, color="gray", linestyle="--", alpha=0.7, label="Sharpe = 0")
+    ax.set_yticks(y_positions)
+    ax.set_yticklabels([r["Model"] for r in results])
+    ax.set_xlabel("Sharpe Ratio")
+    ax.set_title(f"Sharpe Ratio with {confidence_level:.0%} Confidence Intervals", fontweight="bold")
+    ax.grid(True, alpha=0.3, axis="x")
+    ax.legend(loc="lower right")
+
+    # Add significance legend
+    from matplotlib.lines import Line2D
+    legend_elements = [
+        Line2D([0], [0], marker='o', color='w', markerfacecolor='#2ca02c', markersize=10, label='Significant'),
+        Line2D([0], [0], marker='o', color='w', markerfacecolor='#d62728', markersize=10, label='Not Significant'),
+    ]
+    ax.legend(handles=legend_elements, loc="lower right")
+
+    plt.tight_layout()
+    st.pyplot(fig)
+    plt.close()
+
+    # Methodology
+    with st.expander("Methodology Details"):
+        st.markdown("""
+        **Bootstrap Confidence Intervals**
+        - Resample returns with replacement N times
+        - Compute Sharpe ratio for each bootstrap sample
+        - CI bounds = percentiles of bootstrap distribution
+
+        **Lo (2002) Significance Test**
+        - H0: Sharpe ratio = 0
+        - Standard error: SE = sqrt((1 + 0.5*SR²) / T)
+        - T-statistic: t = SR / SE
+        - P-value from t-distribution with T-1 degrees of freedom
+
+        **Jobson-Korkie Test (for benchmark comparison)**
+        - H0: Sharpe_model = Sharpe_benchmark
+        - Accounts for correlation between strategies
+        - Uses Memmel (2003) correction for small samples
+
+        **Interpretation**
+        - p < 0.01: Very strong evidence (***)
+        - p < 0.05: Strong evidence (**)
+        - p < 0.10: Moderate evidence (*)
+        - p >= 0.10: Insufficient evidence
+        """)
+
+
+# ============================================================
 # MAIN APP
 # ============================================================
 
@@ -1025,11 +1297,12 @@ def main():
             st.metric("Avg MaxDD", "-")
 
     # Tabs for different views
-    tab1, tab2, tab3, tab4 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5 = st.tabs([
         "Results Table",
         "Visualizations",
         "Pivot Analysis",
-        "Benchmarks"
+        "Benchmarks",
+        "Statistical Analysis"
     ])
 
     with tab1:
@@ -1125,6 +1398,18 @@ def main():
 
         st.markdown("#### Top Models vs Benchmarks")
         render_benchmarks_comparison(filtered_df, benchmarks_df)
+
+    with tab5:
+        st.markdown("### Statistical Analysis")
+        st.markdown(
+            "Bootstrap confidence intervals and significance tests for top models. "
+            "Uses Lo (2002) for single Sharpe test and Jobson-Korkie for benchmark comparison."
+        )
+
+        # Number of top models to analyze
+        top_n_stat = st.slider("Number of top models to analyze", 1, 10, 3)
+
+        render_statistical_analysis(filtered_df, benchmarks_df, top_n=top_n_stat)
 
     # Footer
     st.markdown("---")
