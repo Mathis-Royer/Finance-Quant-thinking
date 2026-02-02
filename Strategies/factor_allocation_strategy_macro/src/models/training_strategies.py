@@ -166,11 +166,16 @@ def compute_rolling_optimal_weights(
     Compute optimal weights for each target date using FORWARD returns.
 
     For each date T, computes optimal weights that would maximize Sharpe
-    on returns from T+1 to T+horizon. These optimal weights are used as
-    training targets for the model.
+    on returns from T+1 to T+horizon. Uses mean-variance optimization
+    on the monthly returns within the forward period.
 
     The model learns: given macro features at T, predict weights that
     would have been optimal for the NEXT horizon period.
+
+    For h=1: Only 1 observation available, falls back to equal weights
+             (cannot compute covariance from single observation)
+    For h>1: Uses h monthly observations to compute mean and covariance,
+             then optimizes for maximum Sharpe ratio
 
     :param factor_returns (pd.DataFrame): Factor returns with timestamp index
     :param target_dates (pd.DatetimeIndex): Dates for which to compute weights
@@ -181,30 +186,39 @@ def compute_rolling_optimal_weights(
     """
     factor_cols = ["cyclical", "defensive", "value", "growth", "quality", "momentum"]
     optimal_weights = {}
-
-    # Pre-compute forward cumulative returns for all dates
-    forward_cumulative = _compute_forward_cumulative_returns(
-        factor_returns, factor_cols, horizon_months
-    )
+    n_factors = len(factor_cols)
 
     for target_date in target_dates:
         # Find the index of target_date in factor_returns
         date_mask = factor_returns["timestamp"] == target_date
         if not date_mask.any():
             # Target date not in factor_returns, use equal weights
-            optimal_weights[target_date] = np.ones(len(factor_cols)) / len(factor_cols)
+            optimal_weights[target_date] = np.ones(n_factors) / n_factors
             continue
 
         idx = factor_returns.index[date_mask][0]
 
-        # Get forward returns for this date (returns from T+1 to T+horizon)
-        if idx in forward_cumulative.index and not forward_cumulative.loc[idx, factor_cols].isna().any():
-            forward_returns = forward_cumulative.loc[idx, factor_cols].values.reshape(1, -1)
-            # Use softmax on the single forward cumulative return (T+1 to T+h)
-            # This gives truly time-varying optimal weights for each date
+        # Get forward monthly returns for this date (returns from T+1 to T+horizon)
+        forward_returns = _get_forward_monthly_returns(
+            factor_returns, factor_cols, idx, horizon_months
+        )
+
+        if forward_returns is not None and len(forward_returns) >= 2:
+            # Use proper Sharpe optimization with mean-variance framework
+            # Constraints: weights between 5% and 50%, sum to 1
+            weights = compute_optimal_weights(
+                forward_returns,
+                risk_free_rate=0.0,
+                min_weight=0.05,
+                max_weight=0.50,
+            )
+        elif forward_returns is not None and len(forward_returns) == 1:
+            # h=1 case: only 1 observation, use softmax on single return
+            # Cannot compute covariance from single observation
             weights = _softmax_weights(forward_returns.flatten(), temperature=0.1)
         else:
-            weights = np.ones(len(factor_cols)) / len(factor_cols)
+            # Not enough data, use equal weights
+            weights = np.ones(n_factors) / n_factors
 
         optimal_weights[target_date] = weights
 
@@ -267,6 +281,37 @@ def _compute_forward_cumulative_returns(
         result[col] = cumulative
 
     return result
+
+
+def _get_forward_monthly_returns(
+    factor_returns: pd.DataFrame,
+    factor_cols: list,
+    idx: int,
+    horizon_months: int,
+) -> np.ndarray:
+    """
+    Extract the monthly returns from T+1 to T+horizon for a given date index.
+
+    Used to compute Sharpe-optimal weights based on the actual monthly
+    returns in the forward period, enabling proper mean-variance optimization.
+
+    :param factor_returns (pd.DataFrame): Monthly factor returns
+    :param factor_cols (list): Factor column names
+    :param idx (int): Index of the current date T in factor_returns
+    :param horizon_months (int): Horizon in months
+
+    :return forward_returns (np.ndarray): Shape [horizon_months, n_factors]
+    """
+    n = len(factor_returns)
+
+    # Check if we have enough data for the forward period
+    if idx + 1 + horizon_months > n:
+        return None
+
+    # Extract monthly returns from T+1 to T+horizon
+    forward_returns = factor_returns[factor_cols].iloc[idx + 1:idx + 1 + horizon_months].values
+
+    return forward_returns
 
 
 class SupervisedTrainer:
