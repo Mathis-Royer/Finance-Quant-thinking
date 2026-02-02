@@ -50,6 +50,7 @@ from torch.utils.data import Dataset, DataLoader
 
 from data.synthetic_data import SyntheticDataGenerator
 from data.data_loader import Region, MacroDataLoader
+from data.factor_data_loader import FactorDataLoader
 from data.fred_md_loader import FREDMDLoader, FREDMDConfig, load_fred_md_dataset
 from features.feature_engineering import FeatureEngineer, FeatureConfig
 from models.transformer import FactorAllocationTransformer, SharpeRatioLoss
@@ -65,6 +66,7 @@ class MacroDataset(Dataset):
     :param macro_batches (List[Dict]): List of macro batch dictionaries
     :param market_contexts (List[np.ndarray]): List of market context arrays
     :param targets (np.ndarray): Target labels
+    :param cumulative_returns (np.ndarray): Optional cumulative returns for Phase 3 alignment
     """
 
     def __init__(
@@ -72,6 +74,7 @@ class MacroDataset(Dataset):
         macro_batches: List[Dict[str, np.ndarray]],
         market_contexts: List[np.ndarray],
         targets: np.ndarray,
+        cumulative_returns: np.ndarray = None,
     ):
         """
         Initialize dataset.
@@ -79,15 +82,17 @@ class MacroDataset(Dataset):
         :param macro_batches (List[Dict]): Macro features per sample
         :param market_contexts (List[np.ndarray]): Market context per sample
         :param targets (np.ndarray): Target labels
+        :param cumulative_returns (np.ndarray): Cumulative returns per sample (for Phase 3)
         """
         self.macro_batches = macro_batches
         self.market_contexts = market_contexts
         self.targets = targets
+        self.cumulative_returns = cumulative_returns
 
     def __len__(self) -> int:
         return len(self.targets)
 
-    def __getitem__(self, idx: int) -> Tuple[Dict[str, torch.Tensor], torch.Tensor, torch.Tensor]:
+    def __getitem__(self, idx: int) -> Tuple[Dict[str, torch.Tensor], torch.Tensor, torch.Tensor, torch.Tensor]:
         macro_batch = {
             k: torch.tensor(v, dtype=torch.long if "ids" in k else torch.float32)
             for k, v in self.macro_batches[idx].items()
@@ -95,18 +100,24 @@ class MacroDataset(Dataset):
         market_context = torch.tensor(self.market_contexts[idx], dtype=torch.float32)
         target = torch.tensor(self.targets[idx], dtype=torch.float32)
 
-        return macro_batch, market_context, target
+        # Return cumulative returns if available, else zeros
+        if self.cumulative_returns is not None:
+            cum_ret = torch.tensor(self.cumulative_returns[idx], dtype=torch.float32)
+        else:
+            cum_ret = torch.zeros(6, dtype=torch.float32)  # Placeholder for 6 factors
+
+        return macro_batch, market_context, target, cum_ret
 
 
-def collate_fn(batch: List) -> Tuple[Dict[str, torch.Tensor], torch.Tensor, torch.Tensor]:
+def collate_fn(batch: List) -> Tuple[Dict[str, torch.Tensor], torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Collate function for DataLoader.
 
-    :param batch (List): List of (macro_batch, market_context, target) tuples
+    :param batch (List): List of (macro_batch, market_context, target, cum_returns) tuples
 
     :return collated (Tuple): Batched tensors
     """
-    macro_batches, market_contexts, targets = zip(*batch)
+    macro_batches, market_contexts, targets, cum_returns = zip(*batch)
 
     # Stack macro batches
     collated_macro = {}
@@ -115,8 +126,9 @@ def collate_fn(batch: List) -> Tuple[Dict[str, torch.Tensor], torch.Tensor, torc
 
     market_contexts = torch.stack(market_contexts)
     targets = torch.stack(targets)
+    cum_returns = torch.stack(cum_returns)
 
-    return collated_macro, market_contexts, targets
+    return collated_macro, market_contexts, targets, cum_returns
 
 
 class FactorAllocationStrategy:
@@ -255,6 +267,7 @@ class FactorAllocationStrategy:
         factor_data: pd.DataFrame,
         market_data: pd.DataFrame,
         target_data: pd.DataFrame,
+        cumulative_returns: np.ndarray = None,
     ) -> Tuple[MacroDataset, MacroDataset]:
         """
         Prepare datasets for training.
@@ -263,6 +276,7 @@ class FactorAllocationStrategy:
         :param factor_data (pd.DataFrame): Factor returns
         :param market_data (pd.DataFrame): Market context
         :param target_data (pd.DataFrame): Target labels
+        :param cumulative_returns (np.ndarray): Cumulative returns for Phase 3 (optional)
 
         :return train_dataset (MacroDataset): Training dataset
         :return val_dataset (MacroDataset): Validation dataset
@@ -289,16 +303,27 @@ class FactorAllocationStrategy:
         n_val = int(n_samples * self.config["val_split"])
         n_train = n_samples - n_val
 
+        # Handle cumulative_returns alignment
+        train_cum_ret = None
+        val_cum_ret = None
+        if cumulative_returns is not None:
+            # cumulative_returns should have same length as targets
+            if len(cumulative_returns) >= n_samples:
+                train_cum_ret = cumulative_returns[:n_train]
+                val_cum_ret = cumulative_returns[n_train:n_samples]
+
         train_dataset = MacroDataset(
             macro_batches[:n_train],
             market_contexts[:n_train],
             targets[:n_train],
+            cumulative_returns=train_cum_ret,
         )
 
         val_dataset = MacroDataset(
             macro_batches[n_train:],
             market_contexts[n_train:],
             targets[n_train:],
+            cumulative_returns=val_cum_ret,
         )
 
         return train_dataset, val_dataset
@@ -489,7 +514,7 @@ class FactorAllocationStrategy:
         self,
         train_loader: DataLoader,
         val_loader: DataLoader,
-        factor_returns: np.ndarray,
+        factor_returns: np.ndarray = None,
         verbose: Optional[bool] = None,
     ) -> Dict[str, List[float]]:
         """
@@ -497,9 +522,9 @@ class FactorAllocationStrategy:
 
         Uses differentiable Sharpe approximation.
 
-        :param train_loader (DataLoader): Training data
+        :param train_loader (DataLoader): Training data (must include cumulative_returns)
         :param val_loader (DataLoader): Validation data
-        :param factor_returns (np.ndarray): Historical factor returns
+        :param factor_returns (np.ndarray): DEPRECATED - returns now come from dataset
         :param verbose (bool): Override instance verbose setting
 
         :return history (Dict): Training history
@@ -528,17 +553,11 @@ class FactorAllocationStrategy:
             train_loss = 0.0
             prev_weights = None
 
-            for i, (macro_batch, market_context, _) in enumerate(train_loader):
+            for macro_batch, market_context, _, batch_returns in train_loader:
                 macro_batch = {k: v.to(self.device) for k, v in macro_batch.items()}
                 market_context = market_context.to(self.device)
-
-                batch_size = market_context.size(0)
-                returns_idx = min(i * batch_size, len(factor_returns) - batch_size)
-                batch_returns = torch.tensor(
-                    factor_returns[returns_idx:returns_idx + batch_size],
-                    dtype=torch.float32,
-                    device=self.device,
-                )
+                # Use cumulative returns from dataset (properly aligned with samples)
+                batch_returns = batch_returns.to(self.device)
 
                 optimizer.zero_grad()
                 weights = self.model(macro_batch, market_context, output_type="allocation")
@@ -932,8 +951,23 @@ def main():
     elif args.mode == "train":
         # Full training
         print("\nPreparing data...")
+
+        # Compute cumulative returns for Phase 3 (horizon=1 for default)
+        horizon = strategy.config.get("horizon_months", 1)
+        factor_loader = FactorDataLoader()
+        cumulative_returns = factor_loader.get_cumulative_factor_returns_for_horizon(
+            factor_data, horizon
+        )
+
+        # Align cumulative returns with target dates
+        from comparison_runner import align_cumulative_returns
+        aligned_cum_returns = align_cumulative_returns(
+            factor_data, target_data, cumulative_returns
+        )
+
         train_dataset, val_dataset = strategy.prepare_data(
-            macro_data, factor_data, market_data, target_data
+            macro_data, factor_data, market_data, target_data,
+            cumulative_returns=aligned_cum_returns,
         )
 
         train_loader = DataLoader(
@@ -953,9 +987,8 @@ def main():
         history1 = strategy.train_phase1(train_loader, val_loader)
         history2 = strategy.train_phase2(train_loader, val_loader)
 
-        # Get factor returns for phase 3
-        factor_returns = factor_data[["cyclical", "defensive", "value", "growth", "quality", "momentum"]].values
-        history3 = strategy.train_phase3(train_loader, val_loader, factor_returns)
+        # Phase 3 uses cumulative returns from dataset
+        history3 = strategy.train_phase3(train_loader, val_loader)
 
         # Save model
         strategy.save_model("transformer_model.pt")

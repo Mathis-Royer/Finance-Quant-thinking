@@ -35,6 +35,7 @@ from data.factor_data_loader import FactorDataLoader
 from main_strategy import FactorAllocationStrategy, MacroDataset, collate_fn
 from models.training_strategies import TrainingConfig, SupervisedTrainer
 from models.transformer import FactorAllocationTransformer
+from comparison_runner import align_cumulative_returns
 
 
 @dataclass
@@ -242,10 +243,9 @@ class MultiHorizonStrategy:
         # Phase 2: Regression
         history2 = strategy.train_phase2(train_loader, val_loader, verbose=self.verbose)
 
-        # Phase 3: Sharpe optimization with horizon-specific cumulative returns
-        factor_returns = self.cumulative_returns[horizon]
+        # Phase 3: Sharpe optimization (cumulative returns now in dataset)
         history3 = strategy.train_phase3(
-            train_loader, val_loader, factor_returns, verbose=self.verbose
+            train_loader, val_loader, verbose=self.verbose
         )
 
         return {
@@ -275,9 +275,15 @@ class MultiHorizonStrategy:
             target_data = self.targets[horizon]
             strategy = self.strategies[horizon]
 
-            # Prepare data loaders
+            # Align cumulative returns with target dates for proper Phase 3 training
+            aligned_cum_returns = align_cumulative_returns(
+                factor_data, target_data, self.cumulative_returns[horizon]
+            )
+
+            # Prepare data loaders with cumulative returns
             train_ds, val_ds = strategy.prepare_data(
-                macro_data, factor_data, market_data, target_data
+                macro_data, factor_data, market_data, target_data,
+                cumulative_returns=aligned_cum_returns,
             )
 
             # Use generator for reproducibility

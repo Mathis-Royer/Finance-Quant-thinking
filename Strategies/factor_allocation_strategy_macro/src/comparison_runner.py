@@ -127,6 +127,45 @@ def prepare_data(
     return targets, cumulative_returns
 
 
+def align_cumulative_returns(
+    factor_data: pd.DataFrame,
+    target_data: pd.DataFrame,
+    cumulative_returns: np.ndarray,
+) -> np.ndarray:
+    """
+    Align cumulative returns array with target dates.
+
+    cumulative_returns[i] corresponds to factor_data row i.
+    This function returns cumulative returns for each date in target_data.
+
+    :param factor_data (pd.DataFrame): Factor data with timestamps
+    :param target_data (pd.DataFrame): Target data with timestamps
+    :param cumulative_returns (np.ndarray): Full cumulative returns array
+
+    :return aligned_returns (np.ndarray): Returns aligned with target_data dates
+    """
+    factor_dates = pd.to_datetime(factor_data['timestamp']).values
+    target_dates = pd.to_datetime(target_data['timestamp']).values
+
+    # Create date to index mapping for factor_data
+    date_to_idx = {date: i for i, date in enumerate(factor_dates)}
+
+    aligned = []
+    n_factors = cumulative_returns.shape[1] if len(cumulative_returns.shape) > 1 else 6
+
+    for date in target_dates:
+        if date in date_to_idx:
+            idx = date_to_idx[date]
+            if idx < len(cumulative_returns):
+                aligned.append(cumulative_returns[idx])
+            else:
+                aligned.append(np.zeros(n_factors))
+        else:
+            aligned.append(np.zeros(n_factors))
+
+    return np.array(aligned)
+
+
 def train_e2e_model(
     horizon: int,
     macro_data: pd.DataFrame,
@@ -169,7 +208,15 @@ def train_e2e_model(
     )
     strat.create_model()
 
-    train_ds, val_ds = strat.prepare_data(macro_data, factor_data, market_data, target_data)
+    # Align cumulative returns with target dates for proper Phase 3 training
+    aligned_cum_returns = align_cumulative_returns(
+        factor_data, target_data, cumulative_returns
+    )
+
+    train_ds, val_ds = strat.prepare_data(
+        macro_data, factor_data, market_data, target_data,
+        cumulative_returns=aligned_cum_returns,
+    )
 
     g = torch.Generator()
     g.manual_seed(seed)
@@ -194,7 +241,7 @@ def train_e2e_model(
     if not skip_phases:
         strat.train_phase1(train_loader, val_loader, verbose=False)
         strat.train_phase2(train_loader, val_loader, verbose=False)
-    strat.train_phase3(train_loader, val_loader, cumulative_returns, verbose=False)
+    strat.train_phase3(train_loader, val_loader, verbose=False)
 
     # Backtest and evaluate
     results = strat.backtest(
@@ -949,10 +996,10 @@ class _E2ETrainerWrapper:
         self,
         train_loader: DataLoader,
         val_loader: DataLoader,
-        factor_returns: np.ndarray,
+        factor_returns: np.ndarray = None,
         verbose: bool = False,
     ):
-        """Train with E2E strategy (3 phases)."""
+        """Train with E2E strategy (3 phases). Returns now come from dataset."""
         # Suppress output during tuning
         import sys
         from io import StringIO
@@ -964,7 +1011,7 @@ class _E2ETrainerWrapper:
         try:
             self.trainer.train_phase1(train_loader, val_loader)
             self.trainer.train_phase2(train_loader, val_loader)
-            self.trainer.train_phase3(train_loader, val_loader, factor_returns)
+            self.trainer.train_phase3(train_loader, val_loader)
         finally:
             if not verbose:
                 sys.stdout = old_stdout
@@ -1375,8 +1422,14 @@ def run_combination_walk_forward(
                 )
                 strat.create_model()
 
+                # Align cumulative returns with target dates for proper Phase 3 training
+                aligned_cum_returns = align_cumulative_returns(
+                    factor_data, combined_targets, cumulative_returns
+                )
+
                 train_ds, val_ds = strat.prepare_data(
-                    macro_data, factor_data, market_data, combined_targets
+                    macro_data, factor_data, market_data, combined_targets,
+                    cumulative_returns=aligned_cum_returns,
                 )
 
                 g = torch.Generator()
@@ -1397,18 +1450,12 @@ def run_combination_walk_forward(
                     collate_fn=collate_fn,
                 )
 
-                # Get cumulative returns for training period
-                train_start = pd.Timestamp(window.train_start)
-                val_end = pd.Timestamp(window.val_end)
-                train_mask = (factor_ts['timestamp'] >= train_start) & (factor_ts['timestamp'] <= val_end)
-                train_cum_returns = factor_ts.loc[train_mask, FACTOR_COLUMNS].values
-
                 # 3-phase training OR Phase 3 only (for E2E-P3 ablation)
                 skip_phases = model_config.get('skip_phase1_phase2', False)
                 if not skip_phases:
                     strat.train_phase1(train_loader, val_loader, verbose=False)
                     strat.train_phase2(train_loader, val_loader, verbose=False)
-                strat.train_phase3(train_loader, val_loader, train_cum_returns, verbose=False)
+                strat.train_phase3(train_loader, val_loader, verbose=False)
 
                 # Backtest on test period only
                 test_results = strat.backtest(
@@ -1681,12 +1728,6 @@ def train_final_model(
 
     set_seed(999)  # Different seed for final model
 
-    # Filter factor data for training period
-    factor_ts = factor_data.copy()
-    factor_ts['timestamp'] = pd.to_datetime(factor_ts['timestamp'])
-    train_factor_mask = factor_ts['timestamp'] < cutoff_date
-    train_cum_returns = factor_ts.loc[train_factor_mask, FACTOR_COLUMNS].values
-
     if strategy in ["E2E", "E2E-P3"]:
         # E2E-P3 is the ablation test: Phase 3 only (no curriculum learning)
         is_p3_only = (strategy == "E2E-P3")
@@ -1703,8 +1744,14 @@ def train_final_model(
         )
         strat.create_model()
 
+        # Align cumulative returns with target dates for proper Phase 3 training
+        aligned_cum_returns = align_cumulative_returns(
+            factor_data, train_targets, cumulative_returns
+        )
+
         train_ds, val_ds = strat.prepare_data(
-            macro_data, factor_data, market_data, train_targets
+            macro_data, factor_data, market_data, train_targets,
+            cumulative_returns=aligned_cum_returns,
         )
 
         g = torch.Generator()
@@ -1737,7 +1784,7 @@ def train_final_model(
         if verbose:
             phase_label = "Phase 3 only" if is_p3_only else "Phase 3"
             print(f"  {phase_label}: Sharpe optimization...")
-        strat.train_phase3(train_loader, val_loader, train_cum_returns, verbose=False)
+        strat.train_phase3(train_loader, val_loader, verbose=False)
 
         if verbose:
             print("  Training complete.")
@@ -2278,11 +2325,10 @@ def train_fair_ensemble_models(
         print(f"Models: {n_models} with seeds {base_seed}, {base_seed + seed_step}, ...")
         print(f"{'=' * 60}")
 
-    # Filter factor data for training period
-    factor_ts = factor_data.copy()
-    factor_ts['timestamp'] = pd.to_datetime(factor_ts['timestamp'])
-    train_factor_mask = factor_ts['timestamp'] < cutoff_date
-    train_cum_returns = factor_ts.loc[train_factor_mask, FACTOR_COLUMNS].values
+    # Align cumulative returns with target dates once (shared across all models)
+    aligned_cum_returns = align_cumulative_returns(
+        factor_data, train_targets, cumulative_returns
+    )
 
     models = []
     strategy_obj = None
@@ -2312,7 +2358,8 @@ def train_fair_ensemble_models(
             strat.create_model()
 
             train_ds, val_ds = strat.prepare_data(
-                macro_data, factor_data, market_data, train_targets
+                macro_data, factor_data, market_data, train_targets,
+                cumulative_returns=aligned_cum_returns,
             )
 
             g = torch.Generator()
@@ -2338,7 +2385,7 @@ def train_fair_ensemble_models(
             if not skip_phases:
                 strat.train_phase1(train_loader, val_loader, verbose=False)
                 strat.train_phase2(train_loader, val_loader, verbose=False)
-            strat.train_phase3(train_loader, val_loader, train_cum_returns, verbose=False)
+            strat.train_phase3(train_loader, val_loader, verbose=False)
 
             models.append(copy.deepcopy(strat.model))
             if strategy_obj is None:

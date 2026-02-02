@@ -407,7 +407,7 @@ class SupervisedTrainer:
             train_loss = 0.0
             batch_idx = 0
 
-            for macro_batch, market_context, _ in train_loader:
+            for macro_batch, market_context, _, _ in train_loader:
                 macro_batch = {k: v.to(self.device) for k, v in macro_batch.items()}
                 market_context = market_context.to(self.device)
 
@@ -557,7 +557,7 @@ class EndToEndTrainer:
             self.model.train()
             train_loss = 0.0
 
-            for macro_batch, market_context, targets in train_loader:
+            for macro_batch, market_context, targets, _ in train_loader:
                 macro_batch = {k: v.to(self.device) for k, v in macro_batch.items()}
                 market_context = market_context.to(self.device)
                 targets = targets.to(self.device).unsqueeze(-1)
@@ -581,7 +581,7 @@ class EndToEndTrainer:
             total = 0
 
             with torch.no_grad():
-                for macro_batch, market_context, targets in val_loader:
+                for macro_batch, market_context, targets, _ in val_loader:
                     macro_batch = {k: v.to(self.device) for k, v in macro_batch.items()}
                     market_context = market_context.to(self.device)
                     targets = targets.to(self.device).unsqueeze(-1)
@@ -636,7 +636,7 @@ class EndToEndTrainer:
             self.model.train()
             train_loss = 0.0
 
-            for macro_batch, market_context, targets in train_loader:
+            for macro_batch, market_context, targets, _ in train_loader:
                 macro_batch = {k: v.to(self.device) for k, v in macro_batch.items()}
                 market_context = market_context.to(self.device)
                 targets = targets.to(self.device).unsqueeze(-1)
@@ -657,7 +657,7 @@ class EndToEndTrainer:
             self.model.eval()
             val_loss = 0.0
             with torch.no_grad():
-                for macro_batch, market_context, targets in val_loader:
+                for macro_batch, market_context, targets, _ in val_loader:
                     macro_batch = {k: v.to(self.device) for k, v in macro_batch.items()}
                     market_context = market_context.to(self.device)
                     targets = targets.to(self.device).unsqueeze(-1)
@@ -679,14 +679,14 @@ class EndToEndTrainer:
         self,
         train_loader: DataLoader,
         val_loader: DataLoader,
-        factor_returns: np.ndarray,
+        factor_returns: np.ndarray = None,
     ) -> Dict[str, List[float]]:
         """
         Phase 3: Sharpe ratio optimization.
 
-        :param train_loader (DataLoader): Training data
+        :param train_loader (DataLoader): Training data (must include cumulative_returns)
         :param val_loader (DataLoader): Validation data
-        :param factor_returns (np.ndarray): Historical factor returns
+        :param factor_returns (np.ndarray): DEPRECATED - returns now come from dataset
 
         :return history (Dict): Training history
         """
@@ -745,17 +745,11 @@ class EndToEndTrainer:
             train_loss = 0.0
             prev_weights = None
 
-            for i, (macro_batch, market_context, _) in enumerate(train_loader):
+            for macro_batch, market_context, _, batch_returns in train_loader:
                 macro_batch = {k: v.to(self.device) for k, v in macro_batch.items()}
                 market_context = market_context.to(self.device)
-
-                batch_size = market_context.size(0)
-                returns_idx = min(i * self.config.batch_size, len(factor_returns) - batch_size)
-                batch_returns = torch.tensor(
-                    factor_returns[returns_idx:returns_idx + batch_size],
-                    dtype=torch.float32,
-                    device=self.device,
-                )
+                # Use cumulative returns from dataset (properly aligned with samples)
+                batch_returns = batch_returns.to(self.device)
 
                 optimizer.zero_grad()
                 weights = self.model(macro_batch, market_context, output_type="allocation")
@@ -822,20 +816,20 @@ class EndToEndTrainer:
         self,
         train_loader: DataLoader,
         val_loader: DataLoader,
-        factor_returns: np.ndarray,
+        factor_returns: np.ndarray = None,
     ) -> Dict[str, Dict[str, List[float]]]:
         """
         Run complete 3-phase training.
 
-        :param train_loader (DataLoader): Training data
+        :param train_loader (DataLoader): Training data (must include cumulative_returns)
         :param val_loader (DataLoader): Validation data
-        :param factor_returns (np.ndarray): Factor returns for phase 3
+        :param factor_returns (np.ndarray): DEPRECATED - returns now come from dataset
 
         :return all_history (Dict): History from all phases
         """
         history1 = self.train_phase1(train_loader, val_loader)
         history2 = self.train_phase2(train_loader, val_loader)
-        history3 = self.train_phase3(train_loader, val_loader, factor_returns)
+        history3 = self.train_phase3(train_loader, val_loader)
 
         return {
             "phase1": history1,
