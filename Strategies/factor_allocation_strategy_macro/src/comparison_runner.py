@@ -1550,6 +1550,8 @@ class HoldoutResult:
     accuracy: float = None
     monthly_returns: List[float] = None
     monthly_dates: List[str] = None
+    allocation_weights: List[List[float]] = None  # [n_periods, n_factors]
+    factor_columns: List[str] = None  # factor names for weights
 
 
 def train_final_model(
@@ -1818,6 +1820,11 @@ def evaluate_on_holdout(
     )
     metrics = strategy_obj.evaluate(results, verbose=False)
 
+    # Extract allocation weights if available
+    weights = results.get('weights', None)
+    factor_cols = results.get('factor_columns', None)
+    weights_list = weights.tolist() if weights is not None else None
+
     # Extract monthly returns
     monthly_rets = results.get('portfolio_returns', [])
     monthly_dates_raw = results.get('timestamps', [])
@@ -1846,6 +1853,8 @@ def evaluate_on_holdout(
         accuracy=metrics.get('accuracy', None),
         monthly_returns=monthly_rets,
         monthly_dates=monthly_dates_str,
+        allocation_weights=weights_list,
+        factor_columns=factor_cols,
     )
 
 
@@ -2048,6 +2057,22 @@ def ensemble_predict(
         print(f"  {model_type} IC: {ic*100:+.1f}%")
         print(f"  {model_type} Total Return: {total_return:+.1%}")
 
+    # Prepare allocation weights for storage
+    if output_type == "allocation" and len(avg_weights) > 0:
+        weights_list = avg_weights.tolist()
+        factor_cols = FACTOR_COLUMNS
+    elif output_type == "binary" and len(avg_predictions) > 0:
+        # Build 2-factor weights from predictions for binary mode
+        binary_weights = np.column_stack([
+            np.array(avg_predictions),
+            1 - np.array(avg_predictions)
+        ])
+        weights_list = binary_weights.tolist()
+        factor_cols = ["cyclical", "defensive"]
+    else:
+        weights_list = None
+        factor_cols = None
+
     return HoldoutResult(
         model_type=model_type,
         sharpe=sharpe,
@@ -2056,6 +2081,8 @@ def ensemble_predict(
         total_return=total_return,
         monthly_returns=monthly_returns,
         monthly_dates=monthly_dates,
+        allocation_weights=weights_list,
+        factor_columns=factor_cols,
     )
 
 

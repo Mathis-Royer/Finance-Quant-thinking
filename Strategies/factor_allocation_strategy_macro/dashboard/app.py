@@ -12,6 +12,8 @@ from pathlib import Path
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root / "src"))
 
+import json
+
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -26,7 +28,7 @@ from utils.constants import (
     STRATEGY_ABBREV,
     ALLOCATION_ABBREV,
 )
-from visualization.colormaps import CONFIG_COLORS
+from visualization.colormaps import CONFIG_COLORS, FACTOR_COLORS, FACTOR_ORDER
 from utils.statistics import (
     bootstrap_sharpe_ratio,
     test_sharpe_significance,
@@ -266,6 +268,24 @@ def render_sidebar_filters(df: pd.DataFrame) -> Dict[str, List]:
         "and exponential MaxDD penalty. Models with IC < -30% are rejected."
     )
 
+    # Ranking metric selection
+    st.sidebar.markdown("---")
+    st.sidebar.markdown("## Top Models Ranking")
+    ranking_metric_options = {
+        "Score (Composite)": "score",
+        "Sharpe Ratio": "sharpe",
+        "Information Coefficient": "ic",
+        "Max Drawdown": "maxdd",
+        "Total Return": "total_return",
+    }
+    selected_ranking_label = st.sidebar.selectbox(
+        "Rank top models by",
+        options=list(ranking_metric_options.keys()),
+        index=0,
+        help="Metric used to determine top 3 models in charts and statistical analysis"
+    )
+    ranking_metric = ranking_metric_options[selected_ranking_label]
+
     return {
         "strategies": selected_strategies,
         "allocations": selected_allocations,
@@ -276,6 +296,7 @@ def render_sidebar_filters(df: pd.DataFrame) -> Dict[str, List]:
         "ic_weight": ic_weight,
         "maxdd_weight": maxdd_weight,
         "return_weight": return_weight,
+        "ranking_metric": ranking_metric,
     }
 
 
@@ -695,13 +716,19 @@ def render_scatter_final_vs_ensemble(df: pd.DataFrame):
     plt.close()
 
 
-def render_cumulative_returns(df: pd.DataFrame, benchmarks_df: pd.DataFrame = None, top_n: int = 3):
+def render_cumulative_returns(
+    df: pd.DataFrame,
+    benchmarks_df: pd.DataFrame = None,
+    top_n: int = 3,
+    ranking_metric: str = "score",
+):
     """
     Render cumulative returns chart for top N models vs benchmarks.
 
     :param df (pd.DataFrame): DataFrame with monthly_returns column
     :param benchmarks_df (pd.DataFrame): Benchmarks DataFrame with monthly_returns
     :param top_n (int): Number of top models to show
+    :param ranking_metric (str): Metric to use for ranking (score, sharpe, ic, maxdd, total_return)
     """
     if len(df) == 0:
         return
@@ -711,8 +738,9 @@ def render_cumulative_returns(df: pd.DataFrame, benchmarks_df: pd.DataFrame = No
         st.info("Monthly returns data not available. Re-export results from notebook to enable this chart.")
         return
 
-    # Get top N models by Score
-    top_models = df.nlargest(top_n, "score").copy()
+    # Get top N models by selected metric
+    # For maxdd, higher (less negative) is better, so use nlargest
+    top_models = df.nlargest(top_n, ranking_metric).copy()
 
     # Filter models that have monthly returns data
     top_models = top_models[top_models["monthly_returns"].str.len() > 0]
@@ -799,13 +827,112 @@ def render_cumulative_returns(df: pd.DataFrame, benchmarks_df: pd.DataFrame = No
     ax.axhline(y=1, color="gray", linestyle="-", linewidth=0.5, alpha=0.5)
     ax.set_xlabel("Month (Holdout)")
     ax.set_ylabel("Cumulative Return (Wealth)")
-    ax.set_title(f"Top {top_n} Models (by Score) vs Benchmarks: Cumulative Returns", fontweight="bold")
+    metric_label = {"score": "Score", "sharpe": "Sharpe", "ic": "IC", "maxdd": "MaxDD", "total_return": "Return"}.get(ranking_metric, ranking_metric)
+    ax.set_title(f"Top {top_n} Models (by {metric_label}) vs Benchmarks: Cumulative Returns", fontweight="bold")
     ax.legend(loc="upper left", fontsize=9)
     ax.grid(True, alpha=0.3)
 
     plt.tight_layout()
     st.pyplot(fig)
     plt.close()
+
+
+def render_factor_allocation_charts(df: pd.DataFrame, top_n: int = 3, ranking_metric: str = "score"):
+    """
+    Render stacked area charts showing factor allocation evolution for top N models.
+
+    One chart per model showing how allocation weights change over the holdout period.
+
+    :param df (pd.DataFrame): DataFrame with allocation_weights and factor_columns columns
+    :param top_n (int): Number of top models to display
+    :param ranking_metric (str): Metric to use for ranking (score, sharpe, ic, maxdd, total_return)
+    """
+    # Check if allocation_weights column exists
+    if "allocation_weights" not in df.columns:
+        st.info("Allocation weights not available. Re-run notebook and export results to enable this chart.")
+        return
+
+    # Filter to models with allocation weights
+    df_with_weights = df[df["allocation_weights"].str.len() > 0].copy()
+
+    if len(df_with_weights) == 0:
+        st.info("No allocation weight data available. Re-run notebook Step 3 and re-export results.")
+        return
+
+    # Get top N by selected metric
+    top_models = df_with_weights.nlargest(min(top_n, len(df_with_weights)), ranking_metric)
+
+    if len(top_models) == 0:
+        st.info("No models with allocation weights found.")
+        return
+
+    # Create charts in columns
+    n_models = len(top_models)
+    cols = st.columns(min(n_models, 3))
+
+    for i, (_, row) in enumerate(top_models.iterrows()):
+        col = cols[i % 3]
+
+        with col:
+            try:
+                # Parse weights and factors
+                weights = json.loads(row["allocation_weights"])
+                factors = row["factor_columns"].split(",") if row.get("factor_columns") else FACTOR_ORDER
+
+                if not weights or len(weights) == 0:
+                    continue
+
+                weights_arr = np.array(weights)
+                n_periods = weights_arr.shape[0]
+
+                # Create figure
+                fig, ax = plt.subplots(figsize=(6, 4))
+
+                # Get colors for factors
+                colors = [FACTOR_COLORS.get(f.strip(), "#999999") for f in factors]
+
+                # Create stacked area chart
+                ax.stackplot(
+                    range(n_periods),
+                    weights_arr.T,
+                    labels=[f.strip() for f in factors],
+                    colors=colors,
+                    alpha=0.85
+                )
+
+                # Create label
+                config_suffix = CONFIG_SUFFIX.get(row.get("config", "baseline"), "")
+                label = (
+                    f"{row['strategy']}-{row['allocation'][0]}-{row['horizon']}M"
+                    f"{config_suffix}-{MODEL_TYPE_ABBREV.get(row['model_type'], '?')}"
+                )
+
+                ax.set_title(f"{label}\nScore: {row['score']:.1%}", fontweight="bold", fontsize=10)
+                ax.set_xlabel("Month (Holdout)", fontsize=9)
+                ax.set_ylabel("Weight", fontsize=9)
+                ax.set_xlim(0, n_periods - 1)
+                ax.set_ylim(0, 1)
+
+                # Format y-axis as percentage
+                ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: f"{x:.0%}"))
+
+                # Legend outside plot
+                ax.legend(
+                    loc="upper left",
+                    bbox_to_anchor=(1.02, 1),
+                    fontsize=7,
+                    frameon=True
+                )
+
+                ax.grid(True, alpha=0.3, axis="y")
+
+                plt.tight_layout()
+                st.pyplot(fig)
+                plt.close()
+
+            except (json.JSONDecodeError, ValueError, KeyError) as e:
+                st.warning(f"Could not parse allocation weights for model: {e}")
+                continue
 
 
 def render_config_comparison(df: pd.DataFrame):
@@ -918,30 +1045,36 @@ def render_config_comparison(df: pd.DataFrame):
     plt.close()
 
 
-def render_benchmarks_comparison(df: pd.DataFrame, benchmarks_df: pd.DataFrame):
-    """Render comparison with benchmarks."""
+def render_benchmarks_comparison(df: pd.DataFrame, benchmarks_df: pd.DataFrame, ranking_metric: str = "score"):
+    """
+    Render comparison with benchmarks.
+
+    :param df (pd.DataFrame): DataFrame with model results
+    :param benchmarks_df (pd.DataFrame): DataFrame with benchmark results
+    :param ranking_metric (str): Metric to use for ranking top 3 models
+    """
     if len(df) == 0:
         return
 
-    # Metric selection
+    # Metric selection for display
     metric_options = {
         "Sharpe Ratio": "sharpe",
         "Max Drawdown": "maxdd",
         "Total Return": "total_return",
     }
     selected_metric_label = st.selectbox(
-        "Select Metric",
+        "Display Metric",
         options=list(metric_options.keys()),
         index=0,
         key="benchmark_metric_select",
     )
     metric_col = metric_options[selected_metric_label]
 
-    # Get top 3 models by SCORE (always the same regardless of displayed metric)
+    # Get top 3 models by selected ranking metric
     cols_to_select = ["strategy", "allocation", "horizon", "model_type", "sharpe", "maxdd", "total_return", "score"]
     if "config" in df.columns:
         cols_to_select.append("config")
-    top_models = df.nlargest(3, "score")[cols_to_select].copy()
+    top_models = df.nlargest(3, ranking_metric)[cols_to_select].copy()
 
     type_abbrev = MODEL_TYPE_ABBREV
     config_abbrev = CONFIG_SUFFIX
@@ -984,7 +1117,8 @@ def render_benchmarks_comparison(df: pd.DataFrame, benchmarks_df: pd.DataFrame):
     else:
         ax.set_xlabel(f"{selected_metric_label} (%)")
         ax.xaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: f"{x:.0f}%"))
-    ax.set_title(f"Top 3 Models (by Score) vs Benchmarks - {selected_metric_label}", fontweight="bold")
+    rank_label = {"score": "Score", "sharpe": "Sharpe", "ic": "IC", "maxdd": "MaxDD", "total_return": "Return"}.get(ranking_metric, ranking_metric)
+    ax.set_title(f"Top 3 Models (by {rank_label}) vs Benchmarks - {selected_metric_label}", fontweight="bold")
     ax.grid(True, alpha=0.3, axis="x")
 
     # Legend
@@ -1004,13 +1138,19 @@ def render_benchmarks_comparison(df: pd.DataFrame, benchmarks_df: pd.DataFrame):
 # STATISTICAL ANALYSIS
 # ============================================================
 
-def render_statistical_analysis(df: pd.DataFrame, benchmarks_df: pd.DataFrame = None, top_n: int = 3):
+def render_statistical_analysis(
+    df: pd.DataFrame,
+    benchmarks_df: pd.DataFrame = None,
+    top_n: int = 3,
+    ranking_metric: str = "score",
+):
     """
     Render statistical analysis with bootstrap CIs and significance tests.
 
     :param df (pd.DataFrame): DataFrame with monthly_returns column
     :param benchmarks_df (pd.DataFrame): Benchmarks DataFrame with monthly_returns
     :param top_n (int): Number of top models to analyze
+    :param ranking_metric (str): Metric to use for ranking (score, sharpe, ic, maxdd, total_return)
     """
     if len(df) == 0:
         st.warning("No data available for statistical analysis.")
@@ -1021,8 +1161,8 @@ def render_statistical_analysis(df: pd.DataFrame, benchmarks_df: pd.DataFrame = 
         st.info("Monthly returns data not available. Re-export results from notebook to enable statistical analysis.")
         return
 
-    # Get top N models by Score
-    top_models = df.nlargest(top_n, "score").copy()
+    # Get top N models by selected metric
+    top_models = df.nlargest(top_n, ranking_metric).copy()
 
     # Filter models that have monthly returns data
     top_models = top_models[top_models["monthly_returns"].str.len() > 0]
@@ -1336,8 +1476,15 @@ def main():
 
         st.markdown("---")
 
-        st.markdown("#### Cumulative Returns (Top 3 Models vs Benchmarks)")
-        render_cumulative_returns(filtered_df, benchmarks_df, top_n=3)
+        ranking_metric = filters["ranking_metric"]
+        metric_label = {"score": "Score", "sharpe": "Sharpe", "ic": "IC", "maxdd": "MaxDD", "total_return": "Return"}.get(ranking_metric, ranking_metric)
+        st.markdown(f"#### Cumulative Returns (Top 3 Models by {metric_label} vs Benchmarks)")
+        render_cumulative_returns(filtered_df, benchmarks_df, top_n=3, ranking_metric=ranking_metric)
+
+        st.markdown("---")
+
+        st.markdown(f"#### Factor Allocation Evolution (Top 3 Models by {metric_label})")
+        render_factor_allocation_charts(filtered_df, top_n=3, ranking_metric=ranking_metric)
 
         st.markdown("---")
 
@@ -1397,7 +1544,7 @@ def main():
         st.markdown("---")
 
         st.markdown("#### Top Models vs Benchmarks")
-        render_benchmarks_comparison(filtered_df, benchmarks_df)
+        render_benchmarks_comparison(filtered_df, benchmarks_df, ranking_metric=filters["ranking_metric"])
 
     with tab5:
         st.markdown("### Statistical Analysis")
@@ -1409,7 +1556,7 @@ def main():
         # Number of top models to analyze
         top_n_stat = st.slider("Number of top models to analyze", 1, 10, 3)
 
-        render_statistical_analysis(filtered_df, benchmarks_df, top_n=top_n_stat)
+        render_statistical_analysis(filtered_df, benchmarks_df, top_n=top_n_stat, ranking_metric=filters["ranking_metric"])
 
     # Footer
     st.markdown("---")

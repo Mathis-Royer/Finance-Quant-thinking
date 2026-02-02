@@ -150,3 +150,16 @@ CONFIG_COLORS = {
 
 # Ordered list of configs for consistent plotting
 CONFIG_ORDER = ["baseline", "fs", "hpt", "fs+hpt"]
+
+# Color scheme for factor allocations (warm/cool palette for visual distinction)
+FACTOR_COLORS = {
+    "cyclical": "#e41a1c",   # Red - cyclical exposure
+    "defensive": "#377eb8",  # Blue - defensive exposure
+    "value": "#4daf4a",      # Green - value tilt
+    "growth": "#984ea3",     # Purple - growth tilt
+    "quality": "#ff7f00",    # Orange - quality factor
+    "momentum": "#a65628",   # Brown - momentum factor
+}
+
+# Ordered list of factors for consistent plotting
+FACTOR_ORDER = ["cyclical", "defensive", "value", "growth", "quality", "momentum"]

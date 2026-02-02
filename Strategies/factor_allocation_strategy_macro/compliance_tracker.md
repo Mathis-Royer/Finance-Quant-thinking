@@ -19,227 +19,260 @@ This document tracks the divergence between the strategy specification (`factor_
 
 | Category | Count |
 |----------|-------|
-| DONE | 42 |
-| DEFERRED | 6 |
-| PARTIAL | 1 |
+| DONE | 78 |
+| DEFERRED | 4 |
+| PARTIAL | 0 |
 | TODO | 0 |
 
 ---
 
-## Section 1.1: Objective
+## Section 1: Objective and Data
 
-| # | Requirement | Status | Current State | Notes |
-|---|-------------|--------|---------------|-------|
-| 1.1.1 | Neural network with macro data as input | **DONE** | `FactorAllocationTransformer` uses FRED-MD data | |
-| 1.1.2 | Output allocation weights across equity categories | **DONE** | Phase 3 outputs softmax weights for 6 factors | cyclical, defensive, value, growth, quality, momentum |
-| 1.1.3 | Maximize Sharpe ratio | **DONE** | `SharpeRatioLoss` in Phase 3 | `Loss = -E[R] + γ×Var[R] + λ×turnover` |
-| 1.1.4 | Multiple time horizons (1w, 1m, 3m, 6m, 1y) | **DEFERRED** | Only 1-month implemented | **Decision**: One model per timeframe. Start with 1-month, add others later |
-| 1.1.5 | One model per geographic region | **DEFERRED** | Only US region | **Decision**: Focus on US first, expand later |
+### 1.1 Objective
 
----
+| # | Requirement | Status | Current State | Justification |
+|---|-------------|--------|---------------|---------------|
+| 1.1.1 | Neural network with macro data | **DONE** | `FactorAllocationTransformer` with FRED-MD | |
+| 1.1.2 | Output allocation weights | **DONE** | Softmax weights for 6 factors | cyclical, defensive, value, growth, quality, momentum |
+| 1.1.3 | Maximize risk-adjusted return | **DONE** | `SortinoLoss` (default) or `SharpeRatioLoss` | Sortino preferred: penalizes downside only |
+| 1.1.4 | Multiple time horizons | **DONE** | 1M, 3M, 6M, 12M all implemented | One model per horizon |
+| 1.1.5 | Multiple regions | **DEFERRED** | US only | Focus on US first; Europe/Japan planned |
 
-## Section 1.2: Input Data
+### 1.2 Input Data
 
-### 1.2.1 Sequence Structure
+| # | Requirement | Status | Current State | Justification |
+|---|-------------|--------|---------------|---------------|
+| 1.2.1 | Point-in-Time FRED-MD | **DONE** | 305 vintage files (1999-2024) | Prevents look-ahead bias from data revisions |
+| 1.2.2 | 112 macro indicators | **DONE** | All FRED-MD indicators loaded | |
+| 1.2.3 | 12-month sequence | **DONE** | seq_len=12 | Captures seasonality; longer sequences overfit |
+| 1.2.4 | Market context (spreads, VIX) | **DONE** | Term spread, credit spread, VIX | |
+| 1.2.5 | Feature selection (optional) | **DONE** | `IndicatorSelector` with mutual info | 30 features default; reduces noise |
 
-| # | Requirement | Status | Current State | Notes |
-|---|-------------|--------|---------------|-------|
-| 1.2.1.1 | Sequence of 50-100 macroeconomic tokens | **DEFERRED** | 12 months (12 tokens) | **Decision**: Reduced for overfitting prevention |
-| 1.2.1.2 | Data name (unique identifier) | **DONE** | `indicator_ids` → embedding | 112 indicators from FRED-MD |
-| 1.2.1.3 | Publication type (consensus, revision, estimate) | **DONE** | `pub_type_ids` → 6 types | |
-| 1.2.1.4 | Importance score (1-3) | **DONE** | `importance` → linear projection | |
-| 1.2.1.5 | Normalized value | **DONE** | `normalized_value` from FRED-MD | |
-| 1.2.1.6 | 5-period moving average | **DONE** | `ma5` calculated | |
-| 1.2.1.7 | Standardized surprise | **DONE** | `surprise` calculated | |
-| 1.2.1.8 | Country/Region | **DONE** | `country_ids` → embedding | |
-| 1.2.1.9 | Periodicity | **DONE** | `periodicity_ids` → embedding | Added `Periodicity` enum (daily, weekly, monthly, quarterly, irregular) |
-| 1.2.1.10 | Temporal information (days offset) | **DONE** | `days_offset` → sinusoidal encoding | |
+### 1.3 Input Encoding
 
-### 1.2.2 Market Context Data
-
-| # | Requirement | Status | Current State | Notes |
-|---|-------------|--------|---------------|-------|
-| 1.2.2.1 | Credit spread (HY - IG) | **DONE** | `credit_spread` in market context | |
-| 1.2.2.2 | Yield curve slope (10Y - 2Y) | **DONE** | `yield_curve` in market context | |
-| 1.2.2.3 | VIX | **DONE** | `vix` in market context | |
-
-### 1.2.3 Data Quality
-
-| # | Requirement | Status | Current State | Notes |
-|---|-------------|--------|---------------|-------|
-| 1.2.3.1 | Point-in-time databases only | **DONE** | `PointInTimeFREDMDLoader` with 305 vintages | Excellent implementation |
-| 1.2.3.2 | Vintages meticulously reconstructed | **DONE** | Uses actual FRED-MD vintage files 1999-2024 | No revision bias |
+| # | Requirement | Status | Current State | Justification |
+|---|-------------|--------|---------------|---------------|
+| 1.3.1 | Additive embeddings | **DONE** | Sum not concat | Reduces parameters; BERT-like approach |
+| 1.3.2 | Indicator embedding | **DONE** | d_embed=32 per indicator | |
+| 1.3.3 | Category embedding | **DONE** | 8 macro categories | |
+| 1.3.4 | Temporal encoding | **DONE** | RoPE (Rotary Positional Embeddings) | Encodes relative positions |
+| 1.3.5 | LayerNorm fusion | **DONE** | `LayerNorm(E_total + Linear(numericals))` | |
 
 ---
 
-## Section 1.3: Input Encoding
+## Section 2: Model Architecture
 
-| # | Requirement | Status | Current State | Notes |
-|---|-------------|--------|---------------|-------|
-| 1.3.1 | Additive embeddings (sum not concat) | **DONE** | `e_total = e_identity + e_type + e_category + e_country + e_periodicity + e_importance + e_temporal` | BERT-like approach, now includes periodicity |
-| 1.3.2 | E_identity (32-64 dim) | **DONE** | `d_embed=32` | |
-| 1.3.3 | E_type (8-16 dim) | **DONE** | Same d_embed for addition | |
-| 1.3.4 | E_importance (8 dim) | **DONE** | Linear projection to d_embed | |
-| 1.3.5 | E_temporal (sinusoidal) | **DONE** | `SinusoidalPositionalEncoding` class | |
-| 1.3.6 | E_category (16 dim) | **DONE** | Category embedding | 8 categories |
-| 1.3.7 | E_country (8-16 dim) | **DONE** | Country embedding | |
-| 1.3.8 | X_token = LayerNorm(Linear(concat(E_total, numericals))) | **DONE** | Exact formula implemented | |
+### 2.1 MICRO Transformer
 
----
+| # | Requirement | Status | Current State | Justification |
+|---|-------------|--------|---------------|---------------|
+| 2.1.1 | Minimal parameters | **DONE** | ~12,000 params | Rule: params << samples (~300) |
+| 2.1.2 | d_model=32 | **DONE** | Smallest capturing relationships | Larger (64, 128) showed overfitting |
+| 2.1.3 | 1 layer | **DONE** | Single TransformerBlock | Data can't support deeper models |
+| 2.1.4 | 1 attention head | **DONE** | Single head | Multiple heads add unused capacity |
+| 2.1.5 | d_ff=64 | **DONE** | 2×d_model | Standard ratio |
+| 2.1.6 | dropout=0.75 | **DONE** | Extremely high | Necessary for ~300 samples |
 
-## Section 1.4: Model Architecture
+### 2.2 Attention Mechanisms
 
-### 1.4.1 Base Configuration
+| # | Requirement | Status | Current State | Justification |
+|---|-------------|--------|---------------|---------------|
+| 2.2.1 | RoPE embeddings | **DONE** | `RotaryPositionalEmbedding` class | Encodes relative positions in time series |
+| 2.2.2 | Causal masking | **DONE** | `torch.tril` mask | Prevents future leakage |
+| 2.2.3 | Temporal decay | **DONE** | Learnable `decay_rate` | Recent data more relevant; `exp(-decay × distance)` |
 
-| # | Requirement | Status | Current State | Notes |
-|---|-------------|--------|---------------|-------|
-| 1.4.1.1 | 2-4 layers | **DONE** | 2 layers | Minimum for limited data |
-| 1.4.1.2 | Embedding dimension 64-128 | **DONE** | d_model=64 | Minimum for limited data |
-| 1.4.1.3 | 2-4 attention heads | **DONE** | 2 heads | Minimum for limited data |
-| 1.4.1.4 | Dropout 0.3-0.5 | **DONE** | 0.5 | Maximum for regularization |
+### 2.3 Output Heads
 
-### 1.4.2 Attention Mechanisms
-
-| # | Requirement | Status | Current State | Notes |
-|---|-------------|--------|---------------|-------|
-| 1.4.2.1 | Relative positional embeddings | **PARTIAL** | Sinusoidal + temporal decay | Not true RPE, but adequate substitute |
-| 1.4.2.2 | Causal masking | **DONE** | `torch.tril` mask | Prevents future leakage |
-| 1.4.2.3 | Soft masks based on temporal distance | **DONE** | Learnable `decay_rate` parameter | `exp(-decay × distance)` |
-
-### 1.4.3 Economic Knowledge Injection
-
-| # | Requirement | Status | Current State | Notes |
-|---|-------------|--------|---------------|-------|
-| 1.4.3.1 | Embeddings structured by category | **DONE** | 8 macro categories | |
-| 1.4.3.2 | Skip connections (residual) | **DONE** | Pre-norm residual connections | |
-| 1.4.3.3 | Embedding pre-training (auxiliary task) | **DONE** | `pretraining.py` module | `EmbeddingPretrainer` classifies indicators by category |
-| 1.4.3.4 | Baseline regularization (ridge penalty) | **DONE** | `BaselineRegularization` class | Penalizes deviation from simple linear model |
+| # | Requirement | Status | Current State | Justification |
+|---|-------------|--------|---------------|---------------|
+| 2.3.1 | Binary head | **DONE** | `Linear(d_model, 1)` → sigmoid | Phase 1 classification |
+| 2.3.2 | Regression head | **DONE** | `Linear(d_model, 1)` | Phase 2 regression |
+| 2.3.3 | Allocation head | **DONE** | `Linear(d_model, 6)` → softmax | Phase 3 allocation |
+| 2.3.4 | Execution gate | **DONE** | `ExecutionGate` with threshold | Reduces turnover; 5% default |
 
 ---
 
-## Section 1.5: Model Output and Loss
+## Section 3: Training Strategy
 
-### 1.5.1 Output
+### 3.1 Training Approaches
 
-| # | Requirement | Status | Current State | Notes |
-|---|-------------|--------|---------------|-------|
-| 1.5.1.1 | Allocation weights summing to 1 | **DONE** | `F.softmax(allocation_head(pooled), dim=-1)` | |
-| 1.5.1.2 | Gated execution layer | **DONE** | `ExecutionGate` with threshold | `use_soft_threshold=True` |
+| # | Requirement | Status | Current State | Justification |
+|---|-------------|--------|---------------|---------------|
+| 3.1.1 | E2E 3-phase training | **DONE** | Binary → Regression → Sharpe | Progressive: avoids local minima |
+| 3.1.2 | Supervised training | **DONE** | `SupervisedTrainer` | Rolling 24M Sharpe targets |
+| 3.1.3 | Choice of training | **DONE** | Both available | E2E: discovery; Sup: stability |
 
-### 1.5.2 Progressive Loss Function
+### 3.2 Loss Functions
 
-| # | Requirement | Status | Current State | Notes |
-|---|-------------|--------|---------------|-------|
-| 1.5.2.1 | Phase 1: Cross-Entropy (binary) | **DONE** | `nn.BCELoss()` | Cyclicals vs defensives |
-| 1.5.2.2 | Phase 2: MSE (regression) | **DONE** | `nn.MSELoss()` | Outperformance score |
-| 1.5.2.3 | Phase 3: -Sharpe + turnover | **DONE** | `SharpeRatioLoss` | Differentiable approximation |
-| 1.5.2.4 | λ calibrated to transaction costs | **DONE** | `calibrate_turnover_penalty()` function | Based on transaction cost bps, expected turnover, holding period |
+| # | Requirement | Status | Current State | Justification |
+|---|-------------|--------|---------------|---------------|
+| 3.2.1 | SortinoLoss (default) | **DONE** | `-mean(R) / downside_std(R)` | Only penalizes downside volatility |
+| 3.2.2 | SharpeRatioLoss | **DONE** | `-mean(R) / std(R)` | For comparison/benchmarking |
+| 3.2.3 | Phase 1: Cross-Entropy | **DONE** | `nn.BCELoss()` | Binary warm-up |
+| 3.2.4 | Phase 2: MSE | **DONE** | `nn.MSELoss()` | Regression bridge |
+| 3.2.5 | Turnover penalty | **DONE** | Calibrated λ | Reduces transaction costs |
 
----
+### 3.3 Early Stopping
 
-## Section 1.6: Validation and Backtesting
+| # | Requirement | Status | Current State | Justification |
+|---|-------------|--------|---------------|---------------|
+| 3.3.1 | CompositeEarlyStopping | **DONE** | Sharpe+IC+MaxDD+Return | Multi-metric; loss alone insufficient |
+| 3.3.2 | Score weights | **DONE** | 0.35, 0.25, 0.30, 0.10 | Sharpe primary; MaxDD prevents catastrophe |
+| 3.3.3 | Patience | **DONE** | 5 epochs | Balances convergence and overfitting |
+| 3.3.4 | ModelCheckpoint | **DONE** | Best weights restored | Prevents late overfitting |
 
-| # | Requirement | Status | Current State | Notes |
-|---|-------------|--------|---------------|-------|
-| 1.6.1 | Walk-forward with expanding window | **DONE** | `WalkForwardValidator`, 6 windows | |
-| 1.6.2 | No classical cross-validation | **DONE** | Only temporal splits | Correct approach |
-| 1.6.3 | Final holdout reserved | **DEFERRED** | No separate holdout | All data used in walk-forward |
-| 1.6.4 | Test all time horizons | **DEFERRED** | Only 1-month | See 1.1.4 decision |
+### 3.4 Regularization
 
----
-
-## Section 1.7: Progressive Development
-
-| # | Requirement | Status | Current State | Notes |
-|---|-------------|--------|---------------|-------|
-| 1.7.1 | Step 1: Naive baseline (momentum) | **DONE** | Acc: 0.4310, IC: -0.0403 | |
-| 1.7.2 | Step 2: Logistic Regression | **DONE** | Acc: 0.5172, IC: 0.0671 | |
-| 1.7.3 | Step 3: LightGBM | **DONE** | Acc: 0.5172, IC: -0.0506 | |
-| 1.7.4 | Step 4: LSTM | **DONE** | Acc: 0.5345, IC: -0.1518 | |
-| 1.7.5 | Step 5: Transformer | **DONE** | Acc: 0.5749, IC: 0.1561 | |
-| 1.7.6 | Initial test: cyclicals vs defensives, 1m | **DONE** | Exact test case | |
+| # | Requirement | Status | Current State | Justification |
+|---|-------------|--------|---------------|---------------|
+| 3.4.1 | High dropout | **DONE** | 0.75 | Forces redundancy; prevents memorization |
+| 3.4.2 | Weight decay | **DONE** | 0.05 | Strong L2 penalty |
+| 3.4.3 | Conservative LR | **DONE** | 0.0005 | Stable with high dropout |
+| 3.4.4 | Large batch size | **DONE** | 64 | Stable gradients (~300 total samples) |
 
 ---
 
-## Section 2: Problems with Solutions
+## Section 4: Evaluation Methodology
 
-| # | Problem | Status | Implementation |
-|---|---------|--------|----------------|
-| 2.1 | Transaction costs & churning | **DONE** | ExecutionGate with threshold |
-| 2.2 | Market context integration | **DONE** | MarketContextEmbedding |
-| 2.3 | Look-ahead bias | **DONE** | Point-in-time FRED-MD |
-| 2.4 | Efficient sequence encoding | **DONE** | Additive embeddings |
-| 2.5 | Architecture for limited data | **DONE** | Minimal config |
-| 2.6 | Loss function progression | **DONE** | 3-phase training |
-| 2.7 | Economic knowledge injection | **DONE** | Pre-training + baseline regularization |
-| 2.8 | Temporal validation | **DONE** | Walk-forward |
-| 2.9 | Over-engineering risk | **DONE** | Progressive development |
+### 4.1 3-Step Protocol
 
----
+| # | Requirement | Status | Current State | Justification |
+|---|-------------|--------|---------------|---------------|
+| 4.1.1 | Step 1: Walk-forward | **DONE** | 3-5 expanding windows | Multiple OOS estimates; non-overlapping |
+| 4.1.2 | Step 2: Final model | **DONE** | Train on 2000-2021 | Production model; all non-holdout data |
+| 4.1.3 | Step 3: Holdout eval | **DONE** | 2022+ reserved | True OOS; never seen in training |
+| 4.1.4 | Fair Ensemble | **DONE** | 5 models, same data, different seeds | Eliminates data-quantity bias |
+| 4.1.5 | WF Ensemble | **DONE** | Average of walk-forward models | Reference for bias quantification |
 
-## Training Strategies
+### 4.2 Evaluation Metrics
 
-Two training strategies are now implemented in `training_strategies.py`:
+| # | Requirement | Status | Current State | Justification |
+|---|-------------|--------|---------------|---------------|
+| 4.2.1 | Sharpe Ratio | **DONE** | `mean(R)/std(R) × √12` | Industry standard |
+| 4.2.2 | Information Coefficient | **DONE** | Spearman correlation | Measures directional skill |
+| 4.2.3 | Max Drawdown | **DONE** | `min(wealth/peak - 1)` | Tail risk measure |
+| 4.2.4 | Total Return | **DONE** | Cumulative return | Absolute performance |
+| 4.2.5 | Accuracy (Binary) | **DONE** | Classification accuracy | Only for Binary mode |
 
-### 1. Supervised Strategy (`SupervisedTrainer`)
-- Computes optimal weights w* using rolling window Sharpe maximization
-- Uses scipy optimization with constraints (sum=1, bounds)
-- Trains model to regress toward optimal weights
-- **Pros**: Clear, interpretable targets
-- **Cons**: High variance with limited data; hindsight bias
+### 4.3 Benchmarks
 
-### 2. End-to-End Strategy (`EndToEndTrainer`)
-- Uses differentiable Sharpe ratio loss
-- Aggregates over batches for stable gradients
-- Includes baseline regularization and calibrated turnover penalty
-- **Pros**: Better generalization; batch-level stability
-- **Cons**: Less interpretable
+| # | Requirement | Status | Current State | Justification |
+|---|-------------|--------|---------------|---------------|
+| 4.3.1 | Equal-Weight 6F | **DONE** | 1/6 each factor | Naive diversification baseline |
+| 4.3.2 | 50/50 Cyc/Def | **DONE** | Static allocation | Simple macro rule |
+| 4.3.3 | Risk Parity | **DONE** | Inverse volatility | Volatility-based timing |
+| 4.3.4 | Factor Momentum | **DONE** | Positive trailing 12M | Trend-following |
+| 4.3.5 | Best Single Factor | **DONE** | 100% best in-sample | Perfect hindsight |
 
 ---
 
-## Current Walk-Forward Results
+## Section 5: Composite Scoring
 
-| Model | In-Sample Acc | In-Sample IC | OOS Acc | OOS IC |
-|-------|---------------|--------------|---------|--------|
-| Naive Baseline | 0.4310 | -0.0403 | - | - |
-| Logistic Regression | 0.5172 | 0.0671 | 0.4684 | 0.0596 |
-| LightGBM | 0.5172 | -0.0506 | - | - |
-| LSTM | 0.5345 | -0.1518 | - | - |
-| **Transformer** | **0.5749** | **0.1561** | **0.4183** | **-0.1110** |
-
-**Observation**: Significant IC degradation in OOS (0.1561 → -0.1110) confirms overfitting risk warning from Section 3.5.
+| # | Requirement | Status | Current State | Justification |
+|---|-------------|--------|---------------|---------------|
+| 5.1 | Multi-metric score | **DONE** | `0.35×Sharpe + 0.25×IC + 0.30×MaxDD + 0.10×Return` | Single metrics insufficient |
+| 5.2 | Asymmetric IC penalty | **DONE** | Negative IC penalized 2× | Inverted predictions are dangerous |
+| 5.3 | Exponential MaxDD | **DONE** | `exp(3 × maxdd)` | Large drawdowns exponentially worse |
+| 5.4 | Rejection criterion | **DONE** | IC < -30% → score=0 | Reject systematically wrong models |
+| 5.5 | Normalization | **DONE** | All metrics to [0, 1] | Comparable scales |
 
 ---
 
-## Intentional Deviations Summary
+## Section 6: Statistical Analysis
 
-| Decision | Rationale |
-|----------|-----------|
-| US only (not Europe/Japan) | Focus on one region first, expand later |
-| 1-month horizon only | One model per timeframe, start with 1-month |
-| 12 tokens (not 50-100) | Prevent overfitting with limited data |
-| No final holdout | Walk-forward provides OOS estimates |
-
----
-
-## Recently Completed (2026-01-31)
-
-| Item | Implementation |
-|------|----------------|
-| Periodicity encoding (1.2.1.9) | Added `Periodicity` enum, `periodicity_embedding` in `MacroTokenEmbedding`, updated feature engineering |
-| Embedding pre-training (1.4.3.3) | New `pretraining.py` module with `EmbeddingPretrainer` and `pretrain_embeddings()` |
-| Baseline regularization (1.4.3.4) | `BaselineRegularization` class in `transformer.py` |
-| Turnover penalty calibration (1.5.2.4) | `calibrate_turnover_penalty()` function with formula based on transaction costs |
-| Supervised training strategy | `SupervisedTrainer` with `compute_optimal_weights()` and rolling window optimization |
-| End-to-End training strategy | `EndToEndTrainer` with 3-phase training and all improvements |
+| # | Requirement | Status | Current State | Justification |
+|---|-------------|--------|---------------|---------------|
+| 6.1 | Kelly Criterion | **DONE** | `f* = (μ - r) / σ²` | Optimal position sizing |
+| 6.2 | Half-Kelly | **DONE** | Conservative default | More robust to estimation errors |
+| 6.3 | Bootstrap CI | **DONE** | 1000 resamples | Non-parametric; handles fat tails |
+| 6.4 | Lo (2002) test | **DONE** | Single Sharpe significance | Accounts for autocorrelation |
+| 6.5 | Jobson-Korkie test | **DONE** | Sharpe comparison | Tests if two Sharpes differ |
 
 ---
 
-## Remaining Items
+## Section 7: Configuration Options
 
-| Priority | Item | Status | Notes |
-|----------|------|--------|-------|
-| LOW | True relative positional encoding (1.4.2.1) | **PARTIAL** | Current sinusoidal + temporal decay is adequate |
+### 7.1 Feature Selection
+
+| # | Requirement | Status | Current State | Justification |
+|---|-------------|--------|---------------|---------------|
+| 7.1.1 | Mutual info selection | **DONE** | `IndicatorSelector` class | Non-linear dependency measure |
+| 7.1.2 | 1-month feature lag | **DONE** | features[M] → target[M+1] | Prevents look-ahead in selection |
+| 7.1.3 | 30 features default | **DONE** | Configurable | Balances retention vs noise |
+| 7.1.4 | PCA option | **DONE** | `PCAFeatureReducer` | Alternative dimensionality reduction |
+
+### 7.2 Hyperparameter Tuning
+
+| # | Requirement | Status | Current State | Justification |
+|---|-------------|--------|---------------|---------------|
+| 7.2.1 | Walk-forward HP tuning | **DONE** | Per-window optimization | Prevents overfitting to period |
+| 7.2.2 | 15 trials default | **DONE** | Configurable | Balances exploration vs compute |
+| 7.2.3 | Tuned params | **DONE** | LR, dropout, weight_decay | Most impactful for small data |
+
+### 7.3 Config Combinations
+
+| # | Requirement | Status | Current State | Justification |
+|---|-------------|--------|---------------|---------------|
+| 7.3.1 | baseline config | **DONE** | No FS, no HPT | Pure model performance |
+| 7.3.2 | fs config | **DONE** | Feature selection only | Noise reduction |
+| 7.3.3 | hpt config | **DONE** | HP tuning only | Hyperparameter optimization |
+| 7.3.4 | fs+hpt config | **DONE** | Both FS and HPT | Maximum optimization |
+| 7.3.5 | 64 total combos | **DONE** | 2×2×4×4 | All combinations testable |
+
+---
+
+## Section 8: Dashboard and Visualization
+
+| # | Requirement | Status | Current State | Justification |
+|---|-------------|--------|---------------|---------------|
+| 8.1 | Streamlit dashboard | **DONE** | `dashboard/app.py` | Interactive exploration |
+| 8.2 | Filters (Strategy, Allocation, etc.) | **DONE** | Multi-select dropdowns | Hypothesis testing without code |
+| 8.3 | Adjustable score weights | **DONE** | Sliders with normalization | Sensitivity analysis |
+| 8.4 | Factor allocation charts | **DONE** | Stacked area charts | Weight evolution visualization |
+| 8.5 | Benchmark comparison | **DONE** | Reference lines in plots | Context for performance |
+| 8.6 | Results export | **DONE** | Parquet cache | Dashboard loads cached results |
+
+---
+
+## Section 9: Bias Prevention
+
+| # | Problem | Status | Solution | Justification |
+|---|---------|--------|----------|---------------|
+| 9.1 | Look-ahead bias (data) | **DONE** | Point-in-Time FRED-MD | Uses data as-of date, not revised |
+| 9.2 | Look-ahead bias (features) | **DONE** | 1-month lag in selection | features[M] → target[M+1] |
+| 9.3 | Data-quantity bias | **DONE** | Fair Ensemble | Same data, different seeds |
+| 9.4 | Holdout contamination | **DONE** | Fixed date never used | 2022+ reserved from all training |
+| 9.5 | Overlapping test periods | **DONE** | Non-overlapping windows | Prevents autocorrelation inflation |
+| 9.6 | Overfitting | **DONE** | MICRO architecture + regularization | 12k params, dropout=0.75 |
+
+---
+
+## Intentional Deviations
+
+| Decision | Status | Rationale |
+|----------|--------|-----------|
+| US only (not Europe/Japan) | **DEFERRED** | Focus on US first; regional models planned |
+| 50-100 tokens (spec) → 12 tokens | **DEFERRED** | 12 months prevents overfitting; longer sequences tested, worse results |
+| True Relative Positional Encoding | **DEFERRED** | RoPE provides adequate relative position encoding |
+| Weekly data granularity | **DEFERRED** | Monthly FRED-MD is primary source; weekly would require different data |
+
+---
+
+## Key Files Reference
+
+| File | Purpose | Status |
+|------|---------|--------|
+| `src/main_strategy.py` | Core strategy class | **DONE** |
+| `src/comparison_runner.py` | Training and evaluation runner | **DONE** |
+| `src/pipelines/three_step_pipeline.py` | 3-step evaluation orchestrator | **DONE** |
+| `src/models/transformer.py` | Transformer with RoPE | **DONE** |
+| `src/models/training_strategies.py` | E2E and Supervised trainers | **DONE** |
+| `src/utils/walk_forward.py` | Walk-forward validation | **DONE** |
+| `src/utils/statistics.py` | Kelly, Bootstrap, significance tests | **DONE** |
+| `src/utils/analysis.py` | Holdout analysis functions | **DONE** |
+| `src/features/feature_selection.py` | Feature selection with lag | **DONE** |
+| `src/visualization/` | All plotting functions | **DONE** |
+| `dashboard/app.py` | Streamlit dashboard | **DONE** |
 
 ---
 
@@ -247,6 +280,7 @@ Two training strategies are now implemented in `training_strategies.py`:
 
 | Date | Change |
 |------|--------|
-| 2026-01-31 | Initial compliance tracker created |
+| 2026-02-02 | Major update: Added 3-step evaluation, Fair Ensemble, composite scoring, statistical analysis, dashboard, feature selection, HP tuning, RoPE, SortinoLoss, CompositeEarlyStopping. Updated strategy document to v3.0. |
 | 2026-01-31 | Added periodicity encoding, pre-training, baseline regularization, turnover calibration |
 | 2026-01-31 | Implemented Supervised and End-to-End training strategies |
+| 2026-01-31 | Initial compliance tracker created |

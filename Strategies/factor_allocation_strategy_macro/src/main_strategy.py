@@ -670,6 +670,14 @@ class FactorAllocationStrategy:
         if output_type == "allocation" and all_weights:
             results["weights"] = np.array(all_weights)
             results["factor_columns"] = factor_columns
+        # Add weights history for binary mode (cyclical vs defensive)
+        elif output_type == "binary" and predictions:
+            binary_weights = np.column_stack([
+                np.array(predictions),       # cyclical weight (pred probability)
+                1 - np.array(predictions)    # defensive weight
+            ])
+            results["weights"] = binary_weights
+            results["factor_columns"] = ["cyclical", "defensive"]
 
         return results
 

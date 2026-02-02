@@ -4,6 +4,7 @@ Export holdout results to cache for dashboard consumption.
 This script is called from the notebook after running the three-step evaluation.
 """
 
+import json
 import sys
 from pathlib import Path
 from typing import Dict, Any, Tuple, Union
@@ -61,6 +62,18 @@ def export_holdout_results_to_cache(
             else:
                 monthly_returns_str = ""
 
+            # Get allocation weights if available
+            allocation_weights = getattr(result, 'allocation_weights', None)
+            factor_columns = getattr(result, 'factor_columns', None)
+            if allocation_weights is not None:
+                allocation_weights_str = json.dumps(allocation_weights)
+            else:
+                allocation_weights_str = ""
+            if factor_columns is not None:
+                factor_columns_str = ",".join(factor_columns)
+            else:
+                factor_columns_str = ""
+
             data.append({
                 "strategy": strategy,
                 "allocation": allocation,
@@ -73,6 +86,8 @@ def export_holdout_results_to_cache(
                 # total_return is stored as decimal (e.g., 0.0835 for 8.35%)
                 "total_return": result.total_return,
                 "monthly_returns": monthly_returns_str,
+                "allocation_weights": allocation_weights_str,
+                "factor_columns": factor_columns_str,
             })
 
     df = pd.DataFrame(data)
