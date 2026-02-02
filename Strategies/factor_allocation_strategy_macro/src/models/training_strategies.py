@@ -200,18 +200,9 @@ def compute_rolling_optimal_weights(
         # Get forward returns for this date (returns from T+1 to T+horizon)
         if idx in forward_cumulative.index and not forward_cumulative.loc[idx, factor_cols].isna().any():
             forward_returns = forward_cumulative.loc[idx, factor_cols].values.reshape(1, -1)
-            # For single period, we can't compute Sharpe, use the returns directly
-            # to find which factor performed best
-            if horizon_months == 1:
-                # For 1-month, optimal is 100% in best performing factor
-                # But this is too extreme, so we use softmax-like allocation
-                weights = _softmax_weights(forward_returns.flatten(), temperature=0.1)
-            else:
-                # For longer horizons, we need multiple periods to compute Sharpe
-                # Use a sliding window of forward returns centered around target_date
-                weights = _compute_forward_optimal_weights(
-                    factor_returns, factor_cols, target_date, horizon_months
-                )
+            # Use softmax on the single forward cumulative return (T+1 to T+h)
+            # This gives truly time-varying optimal weights for each date
+            weights = _softmax_weights(forward_returns.flatten(), temperature=0.1)
         else:
             weights = np.ones(len(factor_cols)) / len(factor_cols)
 
@@ -238,62 +229,6 @@ def _softmax_weights(returns: np.ndarray, temperature: float = 1.0) -> np.ndarra
     exp_scaled = np.exp(scaled - np.max(scaled))  # Subtract max for numerical stability
     weights = exp_scaled / exp_scaled.sum()
     return np.clip(weights, 0.05, 0.50)  # Ensure min 5%, max 50%
-
-
-def _compute_forward_optimal_weights(
-    factor_returns: pd.DataFrame,
-    factor_cols: list,
-    target_date: pd.Timestamp,
-    horizon_months: int,
-) -> np.ndarray:
-    """
-    Compute optimal weights using ONLY forward returns starting from target_date.
-
-    IMPORTANT: To avoid data leakage, we only use dates >= target_date.
-    This means we collect forward returns for dates T, T+1, T+2, ... to have
-    enough samples for Sharpe optimization without looking at past data.
-
-    :param factor_returns (pd.DataFrame): Factor returns
-    :param factor_cols (list): Factor column names
-    :param target_date (pd.Timestamp): Target date
-    :param horizon_months (int): Horizon in months
-
-    :return weights (np.ndarray): Optimal weights
-    """
-    # Get index of target_date
-    timestamps = factor_returns["timestamp"].values
-    target_idx = np.where(timestamps == target_date)[0]
-    if len(target_idx) == 0:
-        return np.ones(len(factor_cols)) / len(factor_cols)
-    target_idx = target_idx[0]
-
-    # Collect forward returns for multiple periods starting from target
-    # We need enough samples for meaningful Sharpe computation
-    n_samples_needed = 12  # At least 12 samples for Sharpe
-    returns_matrix = []
-
-    returns_arr = factor_returns[factor_cols].values
-    n = len(returns_arr)
-
-    # FIXED: Only use dates >= target_idx to avoid look-ahead bias
-    # We collect forward returns for dates T, T+1, T+2, ... T+n_samples_needed
-    start_idx = target_idx
-    end_idx = min(n - horizon_months, target_idx + n_samples_needed)
-
-    for i in range(start_idx, end_idx):
-        # Forward return from i+1 to i+horizon
-        window = returns_arr[i + 1:i + 1 + horizon_months, :]
-        if len(window) == horizon_months:
-            cumret = np.prod(1 + window, axis=0) - 1
-            returns_matrix.append(cumret)
-
-    if len(returns_matrix) >= 6:
-        returns_matrix = np.array(returns_matrix)
-        weights = compute_optimal_weights(returns_matrix)
-    else:
-        weights = np.ones(len(factor_cols)) / len(factor_cols)
-
-    return weights
 
 
 def _compute_forward_cumulative_returns(
