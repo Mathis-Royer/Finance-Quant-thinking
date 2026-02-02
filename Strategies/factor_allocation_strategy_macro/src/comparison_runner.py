@@ -293,6 +293,7 @@ def train_supervised_model(
         max_seq_len=config['sequence_length'],
     )
 
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     trainer = SupervisedTrainer(
         model=model,
         config=TrainingConfig(
@@ -302,7 +303,7 @@ def train_supervised_model(
             epochs_phase3=config['epochs_phase3'],
             horizon_months=horizon,
         ),
-        device=torch.device('cpu'),
+        device=device,
         verbose=False,
     )
 
@@ -945,10 +946,11 @@ class _SupervisedTrainerWrapper:
     def __init__(self, model, config: TrainingConfig):
         self.model = model
         self.config = config
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.trainer = SupervisedTrainer(
             model=model,
             config=config,
-            device=torch.device('cpu'),
+            device=device,
             verbose=False,
         )
 
@@ -986,10 +988,11 @@ class _E2ETrainerWrapper:
         self.model = model
         self.config = config
         from models.training_strategies import EndToEndTrainer
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.trainer = EndToEndTrainer(
             model=model,
             config=config,
-            device=torch.device('cpu'),
+            device=device,
         )
 
     def train(
@@ -1207,12 +1210,13 @@ def run_with_tuning(
     )
 
     # Create tuner
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     tuner = WalkForwardTuner(
         model_factory=model_factory,
         trainer_factory=trainer_factory,
         space=space,
         config=tuning_config,
-        device=torch.device('cpu'),
+        device=device,
     )
 
     # Run tuning
@@ -1489,10 +1493,11 @@ def run_combination_walk_forward(
                     horizon_months=horizon,
                 )
 
+                device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
                 trainer = SupervisedTrainer(
                     model=model,
                     config=training_config,
-                    device=torch.device('cpu'),
+                    device=device,
                     verbose=False,
                 )
 
@@ -1813,10 +1818,11 @@ def train_final_model(
             horizon_months=horizon,
         )
 
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         trainer = SupervisedTrainer(
             model=model,
             config=training_config,
-            device=torch.device('cpu'),
+            device=device,
             verbose=False,
         )
 
@@ -2413,10 +2419,11 @@ def train_fair_ensemble_models(
                 horizon_months=horizon,
             )
 
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
             trainer = SupervisedTrainer(
                 model=model,
                 config=training_config,
-                device=torch.device('cpu'),
+                device=device,
                 verbose=False,
             )
 

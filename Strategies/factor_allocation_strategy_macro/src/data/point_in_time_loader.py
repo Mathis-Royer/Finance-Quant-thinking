@@ -23,6 +23,7 @@ import pandas as pd
 from dataclasses import dataclass
 import warnings
 import re
+import zipfile
 
 from .data_loader import (
     MacroIndicator,
@@ -81,6 +82,38 @@ class PointInTimeFREDMDLoader:
 
         self._index_vintages()
 
+    def _extract_vintage_zips(self, vintages_dir: Path) -> None:
+        """
+        Extract FRED-MD vintage ZIP files to the vintages directory.
+
+        :param vintages_dir (Path): Target directory for extracted CSV files
+        """
+        parent_dir = vintages_dir.parent
+        zip_pattern = "Historical_vintages_FRED_MD_*.zip"
+        zip_files = list(parent_dir.glob(zip_pattern))
+
+        if not zip_files:
+            return  # No ZIP files found, let caller raise error
+
+        print(f"Vintages directory not found. Extracting from {len(zip_files)} ZIP file(s)...")
+        vintages_dir.mkdir(parents=True, exist_ok=True)
+
+        total_extracted = 0
+        for zip_path in zip_files:
+            print(f"  Extracting: {zip_path.name}")
+            with zipfile.ZipFile(zip_path, 'r') as zf:
+                # Extract only CSV files (skip PDFs and other files)
+                csv_members = [m for m in zf.namelist() if m.endswith('.csv')]
+                for member in csv_members:
+                    # Extract to vintages_dir with flat structure (no subdirs)
+                    filename = Path(member).name
+                    target_path = vintages_dir / filename
+                    with zf.open(member) as src, open(target_path, 'wb') as dst:
+                        dst.write(src.read())
+                    total_extracted += 1
+
+        print(f"  Extracted {total_extracted} vintage files.")
+
     def _index_vintages(self) -> None:
         """
         Index all available vintage files.
@@ -89,6 +122,11 @@ class PointInTimeFREDMDLoader:
         vintage dates to file paths.
         """
         vintages_dir = Path(self.config.vintages_dir)
+
+        if not vintages_dir.exists():
+            # Try to extract from ZIP files
+            self._extract_vintage_zips(vintages_dir)
+
         if not vintages_dir.exists():
             raise FileNotFoundError(f"Vintages directory not found: {vintages_dir}")
 

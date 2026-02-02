@@ -368,7 +368,7 @@ class FactorAllocationStrategy:
             self.model.train()
             train_loss = 0.0
 
-            for macro_batch, market_context, targets in train_loader:
+            for macro_batch, market_context, targets, _ in train_loader:
                 # Move to device
                 macro_batch = {k: v.to(self.device) for k, v in macro_batch.items()}
                 market_context = market_context.to(self.device)
@@ -392,7 +392,7 @@ class FactorAllocationStrategy:
             val_targets = []
 
             with torch.no_grad():
-                for macro_batch, market_context, targets in val_loader:
+                for macro_batch, market_context, targets, _ in val_loader:
                     macro_batch = {k: v.to(self.device) for k, v in macro_batch.items()}
                     market_context = market_context.to(self.device)
                     targets = targets.to(self.device).unsqueeze(-1)
@@ -459,7 +459,7 @@ class FactorAllocationStrategy:
             self.model.train()
             train_loss = 0.0
 
-            for macro_batch, market_context, targets in train_loader:
+            for macro_batch, market_context, targets, _ in train_loader:
                 macro_batch = {k: v.to(self.device) for k, v in macro_batch.items()}
                 market_context = market_context.to(self.device)
                 targets = targets.to(self.device).unsqueeze(-1)
@@ -482,7 +482,7 @@ class FactorAllocationStrategy:
             val_targets = []
 
             with torch.no_grad():
-                for macro_batch, market_context, targets in val_loader:
+                for macro_batch, market_context, targets, _ in val_loader:
                     macro_batch = {k: v.to(self.device) for k, v in macro_batch.items()}
                     market_context = market_context.to(self.device)
                     targets = targets.to(self.device).unsqueeze(-1)
