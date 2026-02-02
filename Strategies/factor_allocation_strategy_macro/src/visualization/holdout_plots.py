@@ -81,7 +81,7 @@ def _get_available_combos(
             horizons.add(h)
 
     # Maintain consistent order
-    strat_order = [s for s in ["E2E", "Sup"] if s in strategies]
+    strat_order = [s for s in ["E2E", "E2E-P3", "Sup"] if s in strategies]
     alloc_order = [a for a in ["Binary", "Multi"] if a in allocations]
     horiz_order = sorted(horizons)
 
@@ -125,6 +125,8 @@ def plot_final_vs_ensemble_bars(
         categories.append(('Sup', 'Supervised', lambda d: d['strategy'] == 'Sup'))
     if "E2E" in strategies:
         categories.append(('E2E', 'End-to-End', lambda d: d['strategy'] == 'E2E'))
+    if "E2E-P3" in strategies:
+        categories.append(('E2E-P3', 'E2E Phase3 Only', lambda d: d['strategy'] == 'E2E-P3'))
     if "Multi" in allocations:
         categories.append(('Multi', 'Multi-factor', lambda d: d['allocation'] == 'Multi'))
     if "Binary" in allocations:

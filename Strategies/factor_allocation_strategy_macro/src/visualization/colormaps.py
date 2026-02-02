@@ -110,10 +110,12 @@ def create_return_colormap(
 
 # Color schemes for different combination types
 COMBINATION_COLORS = {
-    ('E2E', 'Binary'): '#1f77b4',  # Blue
-    ('E2E', 'Multi'): '#ff7f0e',   # Orange
-    ('Sup', 'Binary'): '#2ca02c',  # Green
-    ('Sup', 'Multi'): '#d62728',   # Red
+    ('E2E', 'Binary'): '#1f77b4',     # Blue
+    ('E2E', 'Multi'): '#ff7f0e',      # Orange
+    ('E2E-P3', 'Binary'): '#9467bd',  # Purple (Phase 3 only)
+    ('E2E-P3', 'Multi'): '#e377c2',   # Pink (Phase 3 only)
+    ('Sup', 'Binary'): '#2ca02c',     # Green
+    ('Sup', 'Multi'): '#d62728',      # Red
 }
 
 # Color scheme for horizons

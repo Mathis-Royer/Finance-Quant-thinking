@@ -41,19 +41,21 @@ class TrainingConfig:
     :param learning_rate (float): Base learning rate
     :param batch_size (int): Batch size
     :param weight_decay (float): L2 regularization
-    :param epochs_phase1 (int): Epochs for binary classification
-    :param epochs_phase2 (int): Epochs for regression
-    :param epochs_phase3 (int): Epochs for Sharpe optimization
+    :param epochs_phase1 (int): Epochs for binary classification (E2E only)
+    :param epochs_phase2 (int): Epochs for regression (E2E only)
+    :param epochs_phase3 (int): Epochs for Sharpe optimization (E2E only)
+    :param epochs_supervised (int): Total epochs for Supervised training (default: sum of E2E phases)
     :param use_pretraining (bool): Use embedding pre-training
     :param use_baseline_reg (bool): Use baseline regularization
     :param baseline_penalty (float): Baseline regularization weight
     :param transaction_cost_bps (float): Transaction cost in basis points
-    :param rolling_window_months (int): Rolling window for Sharpe calculation (Supervised)
+    :param rolling_window_months (int): DEPRECATED - not used
     :param gamma (float): Risk aversion for Sharpe loss (0 = pure Sharpe)
     :param horizon_months (int): Prediction horizon for Sharpe optimization (1, 3, 6, or 12)
     :param early_stopping (bool): Enable early stopping
     :param early_stopping_patience (int): Epochs to wait before stopping
     :param early_stopping_min_delta (float): Minimum improvement threshold
+    :param skip_phase1_phase2 (bool): Skip Phase 1 and 2, only run Phase 3 (for ablation tests)
     """
     learning_rate: float = 0.0005
     batch_size: int = 64            # Increased from 32
@@ -61,11 +63,12 @@ class TrainingConfig:
     epochs_phase1: int = 30
     epochs_phase2: int = 20
     epochs_phase3: int = 20
+    epochs_supervised: int = 70     # Same as E2E total (30+20+20) for fair comparison
     use_pretraining: bool = True
     use_baseline_reg: bool = True
     baseline_penalty: float = 0.1
     transaction_cost_bps: float = 10.0
-    rolling_window_months: int = 24  # Increased from 12 for stability
+    rolling_window_months: int = 24  # DEPRECATED - kept for backward compatibility
     gamma: float = 0.0              # Changed to 0 for true Sharpe
     horizon_months: int = 1
     # Early stopping
@@ -76,6 +79,8 @@ class TrainingConfig:
     loss_type: str = "sortino"  # Default to Sortino (penalizes only downside risk)
     # Early stopping type: 'simple' or 'composite'
     early_stopping_type: str = "composite"  # Default to composite score
+    # Ablation test option: skip Phase 1 and 2 in E2E
+    skip_phase1_phase2: bool = False
 
 
 def compute_optimal_weights(
@@ -155,56 +160,58 @@ def compute_rolling_optimal_weights(
     factor_returns: pd.DataFrame,
     target_dates: pd.DatetimeIndex,
     horizon_months: int = 1,
-    rolling_window_months: int = 12,
+    _rolling_window_months: int = 12,
 ) -> Dict[pd.Timestamp, np.ndarray]:
     """
-    Compute optimal weights for each target date using rolling windows.
+    Compute optimal weights for each target date using FORWARD returns.
 
-    For each date, uses a rolling window of historical returns to compute
-    optimal weights for the next horizon period.
+    For each date T, computes optimal weights that would maximize Sharpe
+    on returns from T+1 to T+horizon. These optimal weights are used as
+    training targets for the model.
 
-    For horizons > 1 month, uses cumulative returns over the horizon period
-    to compute optimal weights that maximize Sharpe on cumulative returns.
+    The model learns: given macro features at T, predict weights that
+    would have been optimal for the NEXT horizon period.
 
     :param factor_returns (pd.DataFrame): Factor returns with timestamp index
     :param target_dates (pd.DatetimeIndex): Dates for which to compute weights
     :param horizon_months (int): Prediction horizon (1, 3, 6, or 12)
-    :param rolling_window_months (int): Rolling window for optimization
+    :param _rolling_window_months (int): DEPRECATED, kept for backward compatibility
 
     :return optimal_weights (Dict): Mapping from date to optimal weights
     """
     factor_cols = ["cyclical", "defensive", "value", "growth", "quality", "momentum"]
     optimal_weights = {}
 
-    # Pre-compute cumulative returns if horizon > 1
-    if horizon_months > 1:
-        cumulative_returns = _compute_cumulative_returns_for_optimization(
-            factor_returns, factor_cols, horizon_months
-        )
-    else:
-        cumulative_returns = None
+    # Pre-compute forward cumulative returns for all dates
+    forward_cumulative = _compute_forward_cumulative_returns(
+        factor_returns, factor_cols, horizon_months
+    )
 
     for target_date in target_dates:
-        # Get returns for the rolling window BEFORE target date
-        window_end = target_date
-        window_start = target_date - pd.DateOffset(months=rolling_window_months)
+        # Find the index of target_date in factor_returns
+        date_mask = factor_returns["timestamp"] == target_date
+        if not date_mask.any():
+            # Target date not in factor_returns, use equal weights
+            optimal_weights[target_date] = np.ones(len(factor_cols)) / len(factor_cols)
+            continue
 
-        mask = (factor_returns["timestamp"] >= window_start) & (
-            factor_returns["timestamp"] < window_end
-        )
+        idx = factor_returns.index[date_mask][0]
 
-        if horizon_months == 1:
-            # For 1-month horizon, use simple monthly returns
-            window_returns = factor_returns.loc[mask, factor_cols].values
-        else:
-            # For longer horizons, use cumulative returns
-            if cumulative_returns is not None:
-                window_returns = cumulative_returns.loc[mask, factor_cols].values
+        # Get forward returns for this date (returns from T+1 to T+horizon)
+        if idx in forward_cumulative.index and not forward_cumulative.loc[idx, factor_cols].isna().any():
+            forward_returns = forward_cumulative.loc[idx, factor_cols].values.reshape(1, -1)
+            # For single period, we can't compute Sharpe, use the returns directly
+            # to find which factor performed best
+            if horizon_months == 1:
+                # For 1-month, optimal is 100% in best performing factor
+                # But this is too extreme, so we use softmax-like allocation
+                weights = _softmax_weights(forward_returns.flatten(), temperature=0.1)
             else:
-                window_returns = factor_returns.loc[mask, factor_cols].values
-
-        if len(window_returns) >= 6:  # Minimum 6 observations
-            weights = compute_optimal_weights(window_returns)
+                # For longer horizons, we need multiple periods to compute Sharpe
+                # Use a sliding window of forward returns centered around target_date
+                weights = _compute_forward_optimal_weights(
+                    factor_returns, factor_cols, target_date, horizon_months
+                )
         else:
             weights = np.ones(len(factor_cols)) / len(factor_cols)
 
@@ -213,23 +220,99 @@ def compute_rolling_optimal_weights(
     return optimal_weights
 
 
-def _compute_cumulative_returns_for_optimization(
+def _softmax_weights(returns: np.ndarray, temperature: float = 1.0) -> np.ndarray:
+    """
+    Convert returns to softmax weights with temperature scaling.
+
+    Higher temperature = more uniform weights
+    Lower temperature = more concentrated on best performer
+
+    :param returns (np.ndarray): Factor returns
+    :param temperature (float): Temperature for softmax
+
+    :return weights (np.ndarray): Softmax weights
+    """
+    # Ensure returns is a plain numpy array of floats
+    returns = np.asarray(returns, dtype=np.float64)
+    scaled = returns / temperature
+    exp_scaled = np.exp(scaled - np.max(scaled))  # Subtract max for numerical stability
+    weights = exp_scaled / exp_scaled.sum()
+    return np.clip(weights, 0.05, 0.50)  # Ensure min 5%, max 50%
+
+
+def _compute_forward_optimal_weights(
+    factor_returns: pd.DataFrame,
+    factor_cols: list,
+    target_date: pd.Timestamp,
+    horizon_months: int,
+) -> np.ndarray:
+    """
+    Compute optimal weights using ONLY forward returns starting from target_date.
+
+    IMPORTANT: To avoid data leakage, we only use dates >= target_date.
+    This means we collect forward returns for dates T, T+1, T+2, ... to have
+    enough samples for Sharpe optimization without looking at past data.
+
+    :param factor_returns (pd.DataFrame): Factor returns
+    :param factor_cols (list): Factor column names
+    :param target_date (pd.Timestamp): Target date
+    :param horizon_months (int): Horizon in months
+
+    :return weights (np.ndarray): Optimal weights
+    """
+    # Get index of target_date
+    timestamps = factor_returns["timestamp"].values
+    target_idx = np.where(timestamps == target_date)[0]
+    if len(target_idx) == 0:
+        return np.ones(len(factor_cols)) / len(factor_cols)
+    target_idx = target_idx[0]
+
+    # Collect forward returns for multiple periods starting from target
+    # We need enough samples for meaningful Sharpe computation
+    n_samples_needed = 12  # At least 12 samples for Sharpe
+    returns_matrix = []
+
+    returns_arr = factor_returns[factor_cols].values
+    n = len(returns_arr)
+
+    # FIXED: Only use dates >= target_idx to avoid look-ahead bias
+    # We collect forward returns for dates T, T+1, T+2, ... T+n_samples_needed
+    start_idx = target_idx
+    end_idx = min(n - horizon_months, target_idx + n_samples_needed)
+
+    for i in range(start_idx, end_idx):
+        # Forward return from i+1 to i+horizon
+        window = returns_arr[i + 1:i + 1 + horizon_months, :]
+        if len(window) == horizon_months:
+            cumret = np.prod(1 + window, axis=0) - 1
+            returns_matrix.append(cumret)
+
+    if len(returns_matrix) >= 6:
+        returns_matrix = np.array(returns_matrix)
+        weights = compute_optimal_weights(returns_matrix)
+    else:
+        weights = np.ones(len(factor_cols)) / len(factor_cols)
+
+    return weights
+
+
+def _compute_forward_cumulative_returns(
     factor_returns: pd.DataFrame,
     factor_cols: list,
     horizon_months: int,
 ) -> pd.DataFrame:
     """
-    Compute rolling cumulative returns for Sharpe optimization.
+    Compute FORWARD cumulative returns for Sharpe optimization.
 
-    For each date t, computes the cumulative return from t to t+horizon.
-    This allows computing optimal weights that maximize Sharpe on
-    cumulative returns.
+    For each date t, computes the cumulative return from t+1 to t+horizon.
+    This ensures proper forward-looking alignment: features at T predict
+    returns from T+1 to T+horizon.
 
     :param factor_returns (pd.DataFrame): Monthly factor returns
     :param factor_cols (list): Factor column names
     :param horizon_months (int): Horizon in months
 
-    :return cumulative_df (pd.DataFrame): Cumulative returns with same index
+    :return cumulative_df (pd.DataFrame): Forward cumulative returns with same index
     """
     df = factor_returns.copy()
     result = pd.DataFrame(index=df.index)
@@ -240,9 +323,10 @@ def _compute_cumulative_returns_for_optimization(
         n = len(returns)
         cumulative = np.full(n, np.nan)
 
-        # For each date, compute cumulative return over next horizon months
+        # For each date t, compute cumulative return from t+1 to t+horizon
+        # This is FORWARD-looking: sample at t gets returns starting at t+1
         for i in range(n - horizon_months):
-            window = returns[i:i + horizon_months]
+            window = returns[i + 1:i + 1 + horizon_months]  # FIXED: shift by 1
             cumulative[i] = np.prod(1 + window) - 1
 
         result[col] = cumulative
@@ -316,7 +400,6 @@ class SupervisedTrainer:
             factor_returns,
             pd.DatetimeIndex(target_dates),
             horizon_months=horizon,
-            rolling_window_months=self.config.rolling_window_months,
         )
 
     def train(
@@ -383,7 +466,7 @@ class SupervisedTrainer:
                 )
                 checkpoint = ModelCheckpoint(mode='min')
 
-        total_epochs = self.config.epochs_phase3
+        total_epochs = self.config.epochs_supervised
         for epoch in range(total_epochs):
             self.model.train()
             train_loss = 0.0

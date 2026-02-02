@@ -23,6 +23,7 @@ MODEL_TYPE_ABBREV: Dict[str, str] = {
 STRATEGY_ABBREV: Dict[str, str] = {
     "Sup": "Sup",
     "E2E": "E2E",
+    "E2E-P3": "P3",  # Phase 3 only (ablation test for curriculum learning)
 }
 
 # Allocation abbreviations

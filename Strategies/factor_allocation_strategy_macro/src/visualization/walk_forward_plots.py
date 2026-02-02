@@ -93,6 +93,8 @@ def _get_combinations() -> List[Tuple[str, str, str]]:
     return [
         ("E2E", "Binary", "E2E-Binary"),
         ("E2E", "Multi", "E2E-Multi"),
+        ("E2E-P3", "Binary", "P3-Binary"),
+        ("E2E-P3", "Multi", "P3-Multi"),
         ("Sup", "Binary", "Sup-Binary"),
         ("Sup", "Multi", "Sup-Multi"),
     ]
@@ -197,9 +199,14 @@ def plot_sharpe_heatmaps(
         # Single colorbar for all
         fig.colorbar(im, ax=axes.ravel().tolist(), label='Sharpe Ratio', shrink=0.8)
     else:
-        # Single config: 2×2 grid
+        # Single config: dynamic grid based on number of combinations
         config_suffix = f" [{config_filter}]" if config_filter else ""
-        fig, axes = plt.subplots(2, 2, figsize=figsize)
+        n_combos = len(combinations)
+        n_cols = 2
+        n_rows = (n_combos + n_cols - 1) // n_cols  # Ceiling division
+        adjusted_figsize = (figsize[0], figsize[1] * n_rows // 2)
+        fig, axes = plt.subplots(n_rows, n_cols, figsize=adjusted_figsize)
+        axes = np.atleast_2d(axes)  # Ensure 2D array even for single row
         fig.suptitle(
             f"Walk-Forward OOS Sharpe Ratio by Year x Horizon{config_suffix}",
             fontsize=14,
@@ -207,7 +214,7 @@ def plot_sharpe_heatmaps(
         )
 
         for idx, (strategy, allocation, title) in enumerate(combinations):
-            ax = axes[idx // 2, idx % 2]
+            ax = axes[idx // n_cols, idx % n_cols]
             ax.set_title(title, fontsize=12, fontweight='bold')
 
             heatmap_data = []
@@ -351,9 +358,14 @@ def plot_return_heatmaps(
         # Single colorbar for all
         fig.colorbar(im, ax=axes.ravel().tolist(), label='Return (%)', shrink=0.8)
     else:
-        # Single config: 2×2 grid
+        # Single config: dynamic grid based on number of combinations
         config_suffix = f" [{config_filter}]" if config_filter else ""
-        fig, axes = plt.subplots(2, 2, figsize=figsize)
+        n_combos = len(combinations)
+        n_cols = 2
+        n_rows = (n_combos + n_cols - 1) // n_cols
+        adjusted_figsize = (figsize[0], figsize[1] * n_rows // 2)
+        fig, axes = plt.subplots(n_rows, n_cols, figsize=adjusted_figsize)
+        axes = np.atleast_2d(axes)
         fig.suptitle(
             f"Walk-Forward OOS Returns (%) by Year x Horizon{config_suffix}",
             fontsize=14,
@@ -361,7 +373,7 @@ def plot_return_heatmaps(
         )
 
         for idx, (strategy, allocation, title) in enumerate(combinations):
-            ax = axes[idx // 2, idx % 2]
+            ax = axes[idx // n_cols, idx % n_cols]
             ax.set_title(title, fontsize=12, fontweight='bold')
 
             heatmap_data = []
@@ -439,7 +451,12 @@ def plot_cumulative_returns_grid(
     use_multi_config = config_filter is None and len(all_configs) > 1
 
     config_suffix = f" [{config_filter}]" if config_filter else ""
-    fig, axes = plt.subplots(2, 2, figsize=figsize)
+    n_combos = len(combinations)
+    n_cols = 2
+    n_rows = (n_combos + n_cols - 1) // n_cols
+    adjusted_figsize = (figsize[0], figsize[1] * n_rows // 2)
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=adjusted_figsize)
+    axes = np.atleast_2d(axes)
     fig.suptitle(
         f"Walk-Forward: Concatenated OOS Cumulative Returns{config_suffix}",
         fontsize=14,
@@ -447,7 +464,7 @@ def plot_cumulative_returns_grid(
     )
 
     for idx, (strategy, allocation, title) in enumerate(combinations):
-        ax = axes[idx // 2, idx % 2]
+        ax = axes[idx // n_cols, idx % n_cols]
         ax.set_title(title, fontsize=12, fontweight='bold')
 
         if use_multi_config:

@@ -94,10 +94,88 @@ def load_holdout_results() -> pd.DataFrame:
     return create_sample_data()
 
 
+@st.cache_data
+def load_factor_returns() -> Optional[pd.DataFrame]:
+    """
+    Load factor returns from cache.
+
+    :return df (pd.DataFrame or None): Factor returns with timestamp and factor columns
+    """
+    factor_path = project_root / "data_cache" / "factors" / "all_factors.parquet"
+    if not factor_path.exists():
+        return None
+    return pd.read_parquet(factor_path)
+
+
+def _softmax_weights(returns: np.ndarray, temperature: float = 1.0) -> np.ndarray:
+    """
+    Convert returns to softmax weights with temperature scaling.
+
+    Higher temperature = more uniform weights
+    Lower temperature = more concentrated on best performer
+
+    :param returns (np.ndarray): Factor returns
+    :param temperature (float): Temperature for softmax
+
+    :return weights (np.ndarray): Softmax weights (clipped to 5%-50%)
+    """
+    returns = np.asarray(returns, dtype=np.float64)
+    scaled = returns / temperature
+    exp_scaled = np.exp(scaled - np.max(scaled))  # Subtract max for numerical stability
+    weights = exp_scaled / exp_scaled.sum()
+    return np.clip(weights, 0.05, 0.50)
+
+
+def compute_optimal_allocations(
+    factor_returns: pd.DataFrame,
+    holdout_start: str = "2022-01-01",
+    factor_columns: List[str] = None,
+    temperature: float = 0.1,
+) -> Tuple[List[List[float]], List[str]]:
+    """
+    Compute optimal allocations for each month based on realized returns.
+
+    :param factor_returns: DataFrame with factor returns (timestamp + factor columns)
+    :param holdout_start: Start of holdout period
+    :param factor_columns: Factors to include (default: 6 factors)
+    :param temperature: Softmax temperature (lower = more concentrated on best performer)
+
+    :return (weights_list, dates_list): Optimal weights per month and formatted dates
+    """
+    if factor_columns is None:
+        factor_columns = FACTOR_ORDER
+
+    # Filter to holdout period
+    df = factor_returns.copy()
+    df["timestamp"] = pd.to_datetime(df["timestamp"])
+    holdout_df = df[df["timestamp"] >= holdout_start].sort_values("timestamp").reset_index(drop=True)
+
+    if len(holdout_df) == 0:
+        return [], []
+
+    weights_list = []
+    dates_list = []
+
+    for _, row in holdout_df.iterrows():
+        # Get realized returns for this month
+        returns = row[factor_columns].values.astype(float)
+
+        # Compute softmax weights based on realized returns
+        weights = _softmax_weights(returns, temperature=temperature)
+
+        # Normalize to sum to 1 (after clipping)
+        weights = weights / weights.sum()
+
+        weights_list.append(weights.tolist())
+        dates_list.append(row["timestamp"].strftime("%Y-%m"))
+
+    return weights_list, dates_list
+
+
 def create_sample_data() -> pd.DataFrame:
     """Create sample data for demo purposes."""
     data = []
-    strategies = ["Sup", "E2E"]
+    strategies = ["E2E", "E2E-P3", "Sup"]
     allocations = ["Multi", "Binary"]
     horizons = [1, 3, 6, 12]
     configs = ["baseline"]  # Sample data only uses baseline
@@ -935,6 +1013,129 @@ def render_factor_allocation_charts(df: pd.DataFrame, top_n: int = 3, ranking_me
                 continue
 
 
+def render_optimal_allocation_charts(temperature: float = 0.1):
+    """
+    Render stacked area charts showing optimal factor allocations based on realized returns.
+
+    Displays two charts: Multi (6 factors) and Binary (2 factors).
+
+    :param temperature (float): Softmax temperature for weight computation
+    """
+    factor_returns = load_factor_returns()
+    if factor_returns is None:
+        st.info("Factor returns data not available. Ensure data_cache/factors/all_factors.parquet exists.")
+        return
+
+    # Create two columns for Multi and Binary allocations
+    col_multi, col_binary = st.columns(2)
+
+    # Multi allocation (6 factors)
+    with col_multi:
+        multi_factors = FACTOR_ORDER  # ["cyclical", "defensive", "value", "growth", "quality", "momentum"]
+        weights_multi, dates_multi = compute_optimal_allocations(
+            factor_returns,
+            holdout_start="2022-01-01",
+            factor_columns=multi_factors,
+            temperature=temperature,
+        )
+
+        if len(weights_multi) == 0:
+            st.info("No holdout data available for Multi allocation.")
+        else:
+            _render_single_optimal_chart(
+                weights=weights_multi,
+                dates=dates_multi,
+                factors=multi_factors,
+                title="Multi (6 Factors)",
+            )
+
+    # Binary allocation (2 factors)
+    with col_binary:
+        binary_factors = ["cyclical", "defensive"]
+        weights_binary, dates_binary = compute_optimal_allocations(
+            factor_returns,
+            holdout_start="2022-01-01",
+            factor_columns=binary_factors,
+            temperature=temperature,
+        )
+
+        if len(weights_binary) == 0:
+            st.info("No holdout data available for Binary allocation.")
+        else:
+            _render_single_optimal_chart(
+                weights=weights_binary,
+                dates=dates_binary,
+                factors=binary_factors,
+                title="Binary (Cyclical vs Defensive)",
+            )
+
+
+def _render_single_optimal_chart(
+    weights: List[List[float]],
+    dates: List[str],
+    factors: List[str],
+    title: str,
+):
+    """
+    Render a single stacked area chart for optimal allocations.
+
+    :param weights: List of weight arrays, one per month
+    :param dates: List of date strings (YYYY-MM format)
+    :param factors: List of factor names
+    :param title: Chart title
+    """
+    weights_arr = np.array(weights)
+    n_periods = weights_arr.shape[0]
+
+    fig, ax = plt.subplots(figsize=(8, 4))
+
+    # Get colors for factors
+    colors = [FACTOR_COLORS.get(f, "#999999") for f in factors]
+
+    # Create stacked area chart
+    ax.stackplot(
+        range(n_periods),
+        weights_arr.T,
+        labels=factors,
+        colors=colors,
+        alpha=0.85,
+    )
+
+    ax.set_title(f"Optimal Allocation - {title}", fontweight="bold", fontsize=11)
+    ax.set_xlabel("Month (Holdout)", fontsize=9)
+    ax.set_ylabel("Weight", fontsize=9)
+    ax.set_xlim(0, n_periods - 1)
+    ax.set_ylim(0, 1)
+
+    # Format y-axis as percentage
+    ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: f"{x:.0%}"))
+
+    # Add x-axis tick labels every 6 months for readability
+    if n_periods > 6:
+        tick_indices = list(range(0, n_periods, 6))
+        if n_periods - 1 not in tick_indices:
+            tick_indices.append(n_periods - 1)
+        ax.set_xticks(tick_indices)
+        ax.set_xticklabels([dates[i] for i in tick_indices], rotation=45, ha="right", fontsize=8)
+    else:
+        ax.set_xticks(range(n_periods))
+        ax.set_xticklabels(dates, rotation=45, ha="right", fontsize=8)
+
+    # Legend outside plot
+    ax.legend(
+        loc="upper left",
+        bbox_to_anchor=(1.02, 1),
+        fontsize=8,
+        frameon=True,
+    )
+
+    ax.grid(True, alpha=0.3, axis="y")
+
+    plt.tight_layout()
+    st.pyplot(fig)
+    plt.close()
+
+
 def render_config_comparison(df: pd.DataFrame):
     """
     Render bar chart comparing configs (baseline vs fs vs hpt vs fs+hpt).
@@ -1485,6 +1686,13 @@ def main():
 
         st.markdown(f"#### Factor Allocation Evolution (Top 3 Models by {metric_label})")
         render_factor_allocation_charts(filtered_df, top_n=3, ranking_metric=ranking_metric)
+
+        st.markdown("---")
+
+        st.markdown("#### Optimal Factor Allocation (Based on Realized Returns)")
+        st.caption("Shows what the optimal allocation *would have been* each month based on actual factor returns. "
+                   "Compare with model predictions above to assess prediction quality.")
+        render_optimal_allocation_charts(temperature=0.1)
 
         st.markdown("---")
 

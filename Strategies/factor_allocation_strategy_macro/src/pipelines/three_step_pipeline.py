@@ -40,7 +40,7 @@ class EvaluationConfig:
     holdout_years: int = 3
     holdout_start_date: str = "2022-01-01"
     horizons: List[int] = field(default_factory=lambda: [1, 3, 6, 12])
-    strategies: List[str] = field(default_factory=lambda: ["E2E", "Sup"])
+    strategies: List[str] = field(default_factory=lambda: ["E2E", "E2E-P3", "Sup"])
     allocations: List[str] = field(default_factory=lambda: ["Binary", "Multi"])
     save_models: bool = True
     verbose: bool = True
@@ -53,7 +53,7 @@ class EvaluationConfig:
     run_bias_analysis: bool = False
     bias_cutoff_years: List[int] = field(default_factory=lambda: [2014, 2017, 2020])
     # Enhanced regularization settings
-    dropout: float = 0.75           # Increased from 0.6
+    dropout: float = 0.5            # Reduced from 0.75 to allow more differentiated predictions
     weight_decay: float = 0.05      # Increased from 0.01
     learning_rate: float = 0.0005   # Reduced from 0.001
     batch_size: int = 64            # Increased from 32

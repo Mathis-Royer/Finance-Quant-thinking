@@ -19,7 +19,7 @@ This document tracks the divergence between the strategy specification (`factor_
 
 | Category | Count |
 |----------|-------|
-| DONE | 78 |
+| DONE | 83 |
 | DEFERRED | 4 |
 | PARTIAL | 0 |
 | TODO | 0 |
@@ -99,8 +99,10 @@ This document tracks the divergence between the strategy specification (`factor_
 | # | Requirement | Status | Current State | Justification |
 |---|-------------|--------|---------------|---------------|
 | 3.1.1 | E2E 3-phase training | **DONE** | Binary → Regression → Sharpe | Progressive: avoids local minima |
-| 3.1.2 | Supervised training | **DONE** | `SupervisedTrainer` | Rolling 24M Sharpe targets |
+| 3.1.2 | Supervised training | **DONE** | `SupervisedTrainer` with forward targets | Optimal weights on FORWARD returns (T+1 to T+h) |
 | 3.1.3 | Choice of training | **DONE** | Both available | E2E: discovery; Sup: stability |
+| 3.1.4 | Phase 3-only ablation | **DONE** | `skip_phase1_phase2=True` | Test curriculum learning necessity |
+| 3.1.5 | Equal epochs | **DONE** | E2E=70, Supervised=70 | Fair comparison between strategies |
 
 ### 3.2 Loss Functions
 
@@ -244,6 +246,9 @@ This document tracks the divergence between the strategy specification (`factor_
 | 9.4 | Holdout contamination | **DONE** | Fixed date never used | 2022+ reserved from all training |
 | 9.5 | Overlapping test periods | **DONE** | Non-overlapping windows | Prevents autocorrelation inflation |
 | 9.6 | Overfitting | **DONE** | MICRO architecture + regularization | 12k params, dropout=0.75 |
+| 9.7 | Return alignment bias | **DONE** | Forward shift in cumulative_returns | returns[i+1:i+1+h] not returns[i:i+h] |
+| 9.8 | Supervised target bias | **DONE** | Forward optimal weights | Targets computed on future returns, not past |
+| 9.9 | Training time bias | **DONE** | Equal epochs (70 each) | Fair E2E vs Supervised comparison |
 
 ---
 
@@ -280,6 +285,7 @@ This document tracks the divergence between the strategy specification (`factor_
 
 | Date | Change |
 |------|--------|
+| 2026-02-02 | **Critical fixes**: (1) Fixed return alignment bug - cumulative_returns now uses forward shift `[i+1:i+1+h]`. (2) Supervised training now uses FORWARD optimal weights (not past 24M). (3) Equal epochs (70) for E2E and Supervised. (4) Added `skip_phase1_phase2` option for ablation tests. |
 | 2026-02-02 | Major update: Added 3-step evaluation, Fair Ensemble, composite scoring, statistical analysis, dashboard, feature selection, HP tuning, RoPE, SortinoLoss, CompositeEarlyStopping. Updated strategy document to v3.0. |
 | 2026-01-31 | Added periodicity encoding, pre-training, baseline regularization, turnover calibration |
 | 2026-01-31 | Implemented Supervised and End-to-End training strategies |

@@ -34,7 +34,9 @@ class ComparisonConfig:
     batch_size: int = 32
     epochs_phase1: int = 20
     epochs_phase2: int = 15
-    epochs_phase3: int = 15
+    epochs_phase3: int = 20
+    epochs_supervised: int = 55  # Same as E2E total (20+15+20) for fair comparison
+    skip_phase1_phase2: bool = False  # Set True for Phase 3-only ablation test
 
     def __post_init__(self):
         if self.horizons is None:
@@ -115,12 +117,12 @@ def prepare_data(
 
     cumulative_returns = {}
     for h in horizons:
-        if h == 1:
-            cumulative_returns[h] = factor_data[FACTOR_COLUMNS].values
-        else:
-            cumulative_returns[h] = factor_loader.get_cumulative_factor_returns_for_horizon(
-                factor_data, h
-            )
+        # Always use get_cumulative_factor_returns_for_horizon for proper forward alignment
+        # This ensures cumulative_returns[i] = returns from T_{i+1} to T_{i+h}
+        # Matches the alignment in create_multi_horizon_targets where target[i] uses forward returns
+        cumulative_returns[h] = factor_loader.get_cumulative_factor_returns_for_horizon(
+            factor_data, h
+        )
 
     return targets, cumulative_returns
 
@@ -187,9 +189,11 @@ def train_e2e_model(
         collate_fn=collate_fn,
     )
 
-    # 3-phase training
-    strat.train_phase1(train_loader, val_loader, verbose=False)
-    strat.train_phase2(train_loader, val_loader, verbose=False)
+    # 3-phase training (or Phase 3 only for ablation tests)
+    skip_phases = config.get('skip_phase1_phase2', False)
+    if not skip_phases:
+        strat.train_phase1(train_loader, val_loader, verbose=False)
+        strat.train_phase2(train_loader, val_loader, verbose=False)
     strat.train_phase3(train_loader, val_loader, cumulative_returns, verbose=False)
 
     # Backtest and evaluate
@@ -272,10 +276,12 @@ def train_supervised_model(
     g = torch.Generator()
     g.manual_seed(seed)
 
+    # NOTE: shuffle=False is required for SupervisedTrainer because it indexes
+    # target weights by batch position. Shuffling would cause target mismatch.
     train_loader = DataLoader(
         train_ds,
         batch_size=config['batch_size'],
-        shuffle=True,
+        shuffle=False,
         collate_fn=collate_fn,
         drop_last=True,
         generator=g,
@@ -383,10 +389,10 @@ def run_all_combinations(
                 print(f"  Top 5: {indicators[:5]}")
 
     results = {}
-    total = len(horizons) * 4  # 4 combos per horizon
+    total = len(horizons) * 6  # 6 combos per horizon (E2E, E2E-P3, Sup) x (Binary, Multi)
     current = 0
 
-    # E2E Binary
+    # E2E Binary (full 3-phase curriculum)
     for h in horizons:
         current += 1
         if verbose:
@@ -404,7 +410,7 @@ def run_all_combinations(
             seed=42 + h,
         )
 
-    # E2E Multi
+    # E2E Multi (full 3-phase curriculum)
     for h in horizons:
         current += 1
         if verbose:
@@ -420,6 +426,43 @@ def run_all_combinations(
             config=config,
             output_type="allocation",
             seed=100 + h,
+        )
+
+    # E2E-P3 Binary (Phase 3 only - ablation test for curriculum learning)
+    config_p3_only = {**config, 'skip_phase1_phase2': True}
+    for h in horizons:
+        current += 1
+        if verbose:
+            print(f"[{current}/{total}] E2E-P3 Binary {h}M...")
+        results[("E2E-P3", "Binary", h)] = train_e2e_model(
+            horizon=h,
+            macro_data=macro_data,
+            factor_data=factor_data,
+            market_data=market_data,
+            target_data=targets[h],
+            cumulative_returns=cumulative_returns[h],
+            indicators=indicators,
+            config=config_p3_only,
+            output_type="binary",
+            seed=200 + h,
+        )
+
+    # E2E-P3 Multi (Phase 3 only - ablation test for curriculum learning)
+    for h in horizons:
+        current += 1
+        if verbose:
+            print(f"[{current}/{total}] E2E-P3 Multi {h}M...")
+        results[("E2E-P3", "Multi", h)] = train_e2e_model(
+            horizon=h,
+            macro_data=macro_data,
+            factor_data=factor_data,
+            market_data=market_data,
+            target_data=targets[h],
+            cumulative_returns=cumulative_returns[h],
+            indicators=indicators,
+            config=config_p3_only,
+            output_type="allocation",
+            seed=300 + h,
         )
 
     # Sup Binary
@@ -487,12 +530,13 @@ def format_results_table(
 
     lines = []
     lines.append("=" * 100)
-    lines.append("                                UNIFIED RESULTS: 16 COMBINATIONS")
+    lines.append("                                UNIFIED RESULTS: 24 COMBINATIONS")
+    lines.append("                    (E2E, E2E-P3, Sup) x (Binary, Multi) x (1M, 3M, 6M, 12M)")
     lines.append("=" * 100)
     lines.append(f"{'Strategy':<10} {'Allocation':<12} {'Horizon':<10} {'Sharpe':>10} {'IC':>10} {'Max DD':>10} {'Accuracy':>10}")
     lines.append("-" * 100)
 
-    for strat in ["E2E", "Sup"]:
+    for strat in ["E2E", "E2E-P3", "Sup"]:
         for alloc in ["Binary", "Multi"]:
             for h in horizons:
                 m = results[(strat, alloc, h)]
@@ -544,10 +588,12 @@ def compute_summary_stats(
 
     # By strategy
     e2e_sharpes = [results[k]['sharpe_ratio'] for k in results if k[0] == "E2E"]
+    e2e_p3_sharpes = [results[k]['sharpe_ratio'] for k in results if k[0] == "E2E-P3"]
     sup_sharpes = [results[k]['sharpe_ratio'] for k in results if k[0] == "Sup"]
     summary['strategy'] = {
-        'E2E_avg': np.mean(e2e_sharpes),
-        'Sup_avg': np.mean(sup_sharpes),
+        'E2E_avg': np.mean(e2e_sharpes) if e2e_sharpes else np.nan,
+        'E2E-P3_avg': np.mean(e2e_p3_sharpes) if e2e_p3_sharpes else np.nan,
+        'Sup_avg': np.mean(sup_sharpes) if sup_sharpes else np.nan,
     }
 
     # By allocation
@@ -1312,13 +1358,19 @@ def run_combination_walk_forward(
             set_seed(42 + i * 100 + horizon)
             trained_model = None  # Will be set if save_models=True
 
-            if strategy == "E2E":
-                # Train E2E model
+            if strategy in ["E2E", "E2E-P3"]:
+                # Train E2E model (full 3-phase or Phase 3 only for E2E-P3)
+                # E2E-P3 is the ablation test: no curriculum learning
+                is_p3_only = (strategy == "E2E-P3")
+                model_config = {**config, "horizon_months": horizon}
+                if is_p3_only:
+                    model_config['skip_phase1_phase2'] = True
+
                 strat = FactorAllocationStrategy(
                     region=Region.US,
                     use_fred_md=True,
                     fred_md_indicators=indicators,
-                    config={**config, "horizon_months": horizon},
+                    config=model_config,
                     verbose=False,
                 )
                 strat.create_model()
@@ -1351,9 +1403,11 @@ def run_combination_walk_forward(
                 train_mask = (factor_ts['timestamp'] >= train_start) & (factor_ts['timestamp'] <= val_end)
                 train_cum_returns = factor_ts.loc[train_mask, FACTOR_COLUMNS].values
 
-                # 3-phase training
-                strat.train_phase1(train_loader, val_loader, verbose=False)
-                strat.train_phase2(train_loader, val_loader, verbose=False)
+                # 3-phase training OR Phase 3 only (for E2E-P3 ablation)
+                skip_phases = model_config.get('skip_phase1_phase2', False)
+                if not skip_phases:
+                    strat.train_phase1(train_loader, val_loader, verbose=False)
+                    strat.train_phase2(train_loader, val_loader, verbose=False)
                 strat.train_phase3(train_loader, val_loader, train_cum_returns, verbose=False)
 
                 # Backtest on test period only
@@ -1366,7 +1420,7 @@ def run_combination_walk_forward(
                 # Save model if requested
                 trained_model = copy.deepcopy(strat.model) if save_models else None
 
-            else:  # Supervised
+            elif strategy == "Sup":  # Supervised
                 model = FactorAllocationTransformer(
                     num_indicators=feature_engineer.get_num_indicators(),
                     num_factors=config['num_factors'],
@@ -1412,10 +1466,12 @@ def run_combination_walk_forward(
                 g = torch.Generator()
                 g.manual_seed(42 + i * 100 + horizon)
 
+                # NOTE: shuffle=False is required for SupervisedTrainer because it indexes
+                # target weights by batch position. Shuffling would cause target mismatch.
                 train_loader = DataLoader(
                     train_ds,
                     batch_size=config['batch_size'],
-                    shuffle=True,
+                    shuffle=False,
                     collate_fn=collate_fn,
                     drop_last=True,
                     generator=g,
@@ -1631,12 +1687,18 @@ def train_final_model(
     train_factor_mask = factor_ts['timestamp'] < cutoff_date
     train_cum_returns = factor_ts.loc[train_factor_mask, FACTOR_COLUMNS].values
 
-    if strategy == "E2E":
+    if strategy in ["E2E", "E2E-P3"]:
+        # E2E-P3 is the ablation test: Phase 3 only (no curriculum learning)
+        is_p3_only = (strategy == "E2E-P3")
+        model_config = {**config, "horizon_months": horizon}
+        if is_p3_only:
+            model_config['skip_phase1_phase2'] = True
+
         strat = FactorAllocationStrategy(
             region=Region.US,
             use_fred_md=True,
             fred_md_indicators=indicators,
-            config={**config, "horizon_months": horizon},
+            config=model_config,
             verbose=False,
         )
         strat.create_model()
@@ -1663,15 +1725,18 @@ def train_final_model(
             collate_fn=collate_fn,
         )
 
-        # 3-phase training
+        # 3-phase training OR Phase 3 only (for E2E-P3 ablation)
+        skip_phases = model_config.get('skip_phase1_phase2', False)
+        if not skip_phases:
+            if verbose:
+                print("  Phase 1: Binary classification...")
+            strat.train_phase1(train_loader, val_loader, verbose=False)
+            if verbose:
+                print("  Phase 2: Regression...")
+            strat.train_phase2(train_loader, val_loader, verbose=False)
         if verbose:
-            print("  Phase 1: Binary classification...")
-        strat.train_phase1(train_loader, val_loader, verbose=False)
-        if verbose:
-            print("  Phase 2: Regression...")
-        strat.train_phase2(train_loader, val_loader, verbose=False)
-        if verbose:
-            print("  Phase 3: Sharpe optimization...")
+            phase_label = "Phase 3 only" if is_p3_only else "Phase 3"
+            print(f"  {phase_label}: Sharpe optimization...")
         strat.train_phase3(train_loader, val_loader, train_cum_returns, verbose=False)
 
         if verbose:
@@ -1679,7 +1744,7 @@ def train_final_model(
 
         return copy.deepcopy(strat.model), strat
 
-    else:  # Supervised
+    elif strategy == "Sup":  # Supervised
         model = FactorAllocationTransformer(
             num_indicators=feature_engineer.get_num_indicators(),
             num_factors=config['num_factors'],
@@ -1724,10 +1789,12 @@ def train_final_model(
         g = torch.Generator()
         g.manual_seed(999)
 
+        # NOTE: shuffle=False is required for SupervisedTrainer because it indexes
+        # target weights by batch position. Shuffling would cause target mismatch.
         train_loader = DataLoader(
             train_ds,
             batch_size=config['batch_size'],
-            shuffle=True,
+            shuffle=False,
             collate_fn=collate_fn,
             drop_last=True,
             generator=g,
@@ -2228,12 +2295,18 @@ def train_fair_ensemble_models(
 
         set_seed(seed)
 
-        if strategy == "E2E":
+        if strategy in ["E2E", "E2E-P3"]:
+            # E2E-P3 is the ablation test: Phase 3 only (no curriculum learning)
+            is_p3_only = (strategy == "E2E-P3")
+            model_config = {**config, "horizon_months": horizon}
+            if is_p3_only:
+                model_config['skip_phase1_phase2'] = True
+
             strat = FactorAllocationStrategy(
                 region=Region.US,
                 use_fred_md=True,
                 fred_md_indicators=indicators,
-                config={**config, "horizon_months": horizon},
+                config=model_config,
                 verbose=False,
             )
             strat.create_model()
@@ -2260,16 +2333,18 @@ def train_fair_ensemble_models(
                 collate_fn=collate_fn,
             )
 
-            # 3-phase training
-            strat.train_phase1(train_loader, val_loader, verbose=False)
-            strat.train_phase2(train_loader, val_loader, verbose=False)
+            # 3-phase training OR Phase 3 only (for E2E-P3 ablation)
+            skip_phases = model_config.get('skip_phase1_phase2', False)
+            if not skip_phases:
+                strat.train_phase1(train_loader, val_loader, verbose=False)
+                strat.train_phase2(train_loader, val_loader, verbose=False)
             strat.train_phase3(train_loader, val_loader, train_cum_returns, verbose=False)
 
             models.append(copy.deepcopy(strat.model))
             if strategy_obj is None:
                 strategy_obj = strat
 
-        else:  # Supervised
+        elif strategy == "Sup":  # Supervised
             model = FactorAllocationTransformer(
                 num_indicators=feature_engineer.get_num_indicators(),
                 num_factors=config['num_factors'],
@@ -2314,10 +2389,12 @@ def train_fair_ensemble_models(
             g = torch.Generator()
             g.manual_seed(seed)
 
+            # NOTE: shuffle=False is required for SupervisedTrainer because it indexes
+            # target weights by batch position. Shuffling would cause target mismatch.
             train_loader = DataLoader(
                 train_ds,
                 batch_size=config['batch_size'],
-                shuffle=True,
+                shuffle=False,
                 collate_fn=collate_fn,
                 drop_last=True,
                 generator=g,

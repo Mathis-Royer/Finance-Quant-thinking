@@ -161,16 +161,24 @@ Sharpe loss landscape has flat regions and local minima. Random initialization o
 
 #### 3.1.2 Supervised Training
 
-**Approach**: Compute optimal weights w* using rolling-window Sharpe maximization (scipy SLSQP), then train model to predict w* via MSE loss.
+**Approach**: Compute optimal weights w* using **FORWARD returns** (Sharpe maximization via scipy SLSQP), then train model to predict w* via MSE loss.
 
-**Why 24-month rolling window?**
-- Short windows (6-12M): Noisy, unstable targets
-- Long windows (36M+): Too slow to adapt to regime changes
-- 24M balances stability and responsiveness
+**Critical: Forward-Looking Targets**
+- For each date T, optimal weights are computed on returns from **T+1 to T+horizon**
+- The model learns: "given features at T, predict weights optimal for the NEXT period"
+- This is NOT using past performance to predict future (which would be naive)
+
+**Why forward returns?** The model should learn to predict what WILL BE optimal, not what WAS optimal in the past. Using past 24M returns would teach the model to extrapolate trends, which doesn't work in non-stationary markets.
 
 **When to use Supervised vs E2E?**
-- **Supervised**: More stable, interpretable targets. Assumes optimal weights exist.
-- **E2E**: Can discover novel patterns. Harder to train but potentially better generalization.
+- **Supervised**: More stable, interpretable targets. Ground-truth optimal weights.
+- **E2E**: Can discover patterns beyond optimal-weight approximation. Harder to train.
+
+#### 3.1.3 Ablation Test: Phase 3 Only
+
+**Option**: `skip_phase1_phase2=True` runs E2E with only Phase 3 (no curriculum learning).
+
+**Purpose**: Test if the 3-phase curriculum is beneficial or just adds complexity. If Phase 3-only performs similarly, the curriculum may be unnecessary.
 
 ### 3.2 Loss Functions
 
@@ -225,7 +233,20 @@ Stops when composite score doesn't improve for 5 epochs (patience).
 | learning_rate | 0.0005 | Conservative LR for stable convergence with high dropout |
 | batch_size | 64 | Larger batches for stable gradients (~300 total samples) |
 
-### 3.5 Multi-Horizon Support
+### 3.5 Fair Epoch Comparison
+
+**Problem**: E2E has 3 phases (30+20+20=70 epochs) while Supervised had only 20 epochs. Unfair comparison.
+
+**Solution**: `epochs_supervised=70` (same total as E2E).
+
+| Strategy | Epochs | Breakdown |
+|----------|--------|-----------|
+| E2E | 70 | Phase1: 30, Phase2: 20, Phase3: 20 |
+| Supervised | 70 | Single phase with MSE loss |
+
+This ensures performance differences are due to training approach, not training time.
+
+### 3.6 Multi-Horizon Support
 
 All models **rebalance monthly** (data is monthly). The difference is the **optimization target**:
 
@@ -517,6 +538,20 @@ No single benchmark captures all aspects of factor timing. Model should beat *re
 **Problem**: WF ensemble combines models trained on different data amounts.
 
 **Solution**: Fair Ensemble trains N models on same data, isolating seed variance from data quantity.
+
+### 10.6 Return Alignment (Critical Fix)
+
+**Problem**: For E2E Phase 3 and Supervised training, returns must be **forward-looking** (T+1 to T+horizon), not contemporaneous (T to T+horizon-1).
+
+**Why this matters**: If returns at index i use data from time i (contemporaneous), the model learns correlations that don't exist at prediction time. The model sees features at T and should optimize for returns starting at T+1.
+
+**Solution**: All cumulative return calculations use `returns[i+1:i+1+horizon]` (forward shift).
+
+| Component | Before (Bug) | After (Fixed) |
+|-----------|--------------|---------------|
+| `cumulative_returns[h=1]` | `returns[i]` | `returns[i+1]` |
+| `cumulative_returns[h>1]` | `returns[i:i+h]` | `returns[i+1:i+1+h]` |
+| Supervised targets | Past 24M returns | Forward h-month returns |
 
 ---
 
